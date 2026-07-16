@@ -1,0 +1,51 @@
+# Project: tokiSync — Caveman Rules
+
+# 📌 SECTION 0: CONTEXT
+Start session: Read AI_AGENT_CONTEXT.md (SSOT), PROJECT_HANDOVER_MASTER.md.
+AI_AGENT_CONTEXT.md = Single Source of Truth.
+
+# 📌 SECTION 0.1: ENV
+Terminal command: Use `export PATH=$PATH:/usr/local/bin`. Mac path safety.
+
+# 🚨 SECTION 1: PERMISSIONS
+- 🚫 PROHIBITED: `clasp push`, `rm -rf`, `git push`. DO NOT AUTO-RUN. Guide human.
+- ✅ ALLOWED: `ls`, `cat`, `grep`, `find`, `git status`. Read-only OK.
+- ⚠️ CONDITIONAL: `npm test`, `build`. Run after plan approval.
+
+# 📝 SECTION 2: DOCS
+- Real-time: Unit done → Update `.agent_checkpoint.md`. External memory.
+- Final: Sync `.agent_checkpoint.md` to CONTEXT/HANDOVER/CHANGELOG. Delete temp.
+- HANDOVER > 300 lines → Move old to CHANGELOG. Keep lean.
+
+# 📂 SECTION 2.1: STRUCTURE
+- All MD (except root SSOT) → `documentation/`.
+- `guides/`: How-to. `reports/`: walkthrough. `archive/`: history.
+- Root SSOT: README, CHANGELOG, CONTEXT, HANDOVER. Update README map.
+
+# 🔒 SECTION 3: EDITORIAL
+No shadow echoing. Use actual tools. Human = Final pipeline runner.
+
+# 🔍 SECTION 4: AUDIT
+Post-coding: Logic verify. Edge case check. Report in walkthrough/report.
+
+# 🛠️ SECTION 5: SKILLS
+- Planning: @[concise-planning], @[wiki-architect].
+- Code: @[javascript-pro], @[tailwind-patterns].
+- Perf/Debug: @[performance-engineer], @[systematic-debugging].
+- Security: @[security-auditor], @[vibe-code-auditor].
+
+# 🤖 SECTION 6: AGENTS
+1. Main (Claude/Pro): Strategy. Planning.
+2. Worker (Flash): Implementation. Atomic tasks.
+3. Auditor (3 Pro): Inspect. Edge cases. PASS/FAIL report.
+
+# 🔄 SECTION 7: ERRORS
+Error found → Auditor report → Main re-plan → Worker re-impl. No quick fixes.
+
+# 📝 SECTION 8: HANDOVER
+Model swap: Update `.agent_checkpoint.md`. Read SSOT + state first.
+
+# 🚀 SECTION 9: RELEASE & BRANCH
+- Main: No direct commit. Use PR.
+- Assets: Include dist/tokiSync.user.js, dist/TokiSync_Server_Bundle.gs in Release.
+- 🚫 NO AUTO-COMMIT/RELEASE. Bump version @ COMMIT phase ONLY after human approval.

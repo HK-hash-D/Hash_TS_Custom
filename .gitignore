@@ -1,0 +1,47 @@
+node_modules/
+.DS_Store
+*.sw*
+.idea/
+*.iml
+.vscode/
+
+# Sensitive files
+.clasp.json
+*.env
+
+# Analysis Files (Local only)
+old_*
+
+# Local Analysis Documents (Private)
+doc_refactoring_report.md
+gas_v3_refactoring_analysis.md
+walkthrough.md
+
+# Temporary build artifacts
+dist/
+
+# Consolidated Handover File
+PROJECT_HANDOVER_MASTER.md
+.DS_Store
+# Generated GAS Bundle (CI가 빌드 후 GitHub Pages에 배포)
+dist/TokiSync_Server_Bundle.gs
+
+# AI Agent Context & Brain (Local only)
+brain/
+
+# Graphify Output (Exclude internal state & cache, keep report & html)
+graphify-out/*
+!graphify-out/GRAPH_REPORT.md
+!graphify-out/graph.html
+
+.sem/
+
+scratch/
+tools/
+
+# Local Analysis Images (Private)
+documentation/분석/북토끼*.png
+
+# Vite build target exclusion
+dist-viewer/
+
