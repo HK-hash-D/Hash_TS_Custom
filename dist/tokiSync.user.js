@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TokiSync (Link to Drive)
 // @namespace    http://tampermonkey.net/
-// @version      1.27.4
+// @version      1.26.4
 // @description  Toki series sites -> Google Drive syncing tool (Bundled)
 // @author       hk-hash-d
 // @updateURL    https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
@@ -130,9 +130,6 @@ const EVT = {
     PARSE_VERIFY:       'parse:verify',     // 셀렉터 검증 요청
     PARSE_TEST:         'parse:test',       // 추출 테스트 요청
     RULE_CACHE_CLEAR:   'rule:cache_clear', // 파서 캐시 무효화
-
-    // ── Queue → UI 방향 ─────────────────────────────────
-    STORAGE_FATAL:      'storage:fatal',    // 큐 저장 완전 실패 (재시도 소진)
 };
 
 
@@ -148,28 +145,21 @@ const EVT = {
 /* harmony export */   Gg: function() { return /* binding */ updateQueueItem; },
 /* harmony export */   HO: function() { return /* binding */ stopAllWorkers; },
 /* harmony export */   IS: function() { return /* binding */ getQueue; },
-/* harmony export */   NQ: function() { return /* binding */ destroyWorkerSession; },
-/* harmony export */   PG: function() { return /* binding */ processingSlots; },
 /* harmony export */   WB: function() { return /* binding */ WORKER_STAGE; },
-/* harmony export */   a: function() { return /* binding */ sessionRegistry; },
 /* harmony export */   d$: function() { return /* binding */ removeQueueItem; },
 /* harmony export */   gi: function() { return /* binding */ runSchedulerOnce; },
 /* harmony export */   id: function() { return /* binding */ addEpisodesToQueue; },
 /* harmony export */   kZ: function() { return /* binding */ getQueuePaused; },
 /* harmony export */   lg: function() { return /* binding */ clearQueue; },
 /* harmony export */   mR: function() { return /* binding */ activeWorkers; },
-/* harmony export */   mj: function() { return /* binding */ getSessionToken; },
-/* harmony export */   xE: function() { return /* binding */ touchSessionActivity; },
 /* harmony export */   xx: function() { return /* binding */ _activeProcessing; },
-/* harmony export */   zS: function() { return /* binding */ updateSessionPopupRef; },
 /* harmony export */   zX: function() { return /* binding */ getQueueStats; }
 /* harmony export */ });
-/* unused harmony exports createWorkerSession, updateQueueItemProgress, removeCompletedAndFailedItems */
+/* unused harmony exports updateQueueItemProgress, removeCompletedAndFailedItems */
 /* harmony import */ var _EventBus_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(31);
 /**
- * tokiSync v1.28.0 - Persistent Multi-Queue Batch Core
+ * tokiSync v1.21.0 - Persistent Multi-Queue Batch Core
  * 영속성 디스크 큐 및 이벤트 기반 세마포어 스케줄러 엔진
- * [v1.28.0] saveRawQueue 재시도 + localStorage 폴백 체인 추가
  */
 
 
@@ -186,21 +176,10 @@ const WORKER_STAGE = {
 };
 
 const STORAGE_KEY = 'TOKI_DOWNLOAD_QUEUE';
-const MAX_CONCURRENCY = 2; // 최대 동시 다운로드 수 (현재 직렬 처리로 고정)
-
-// [v1.28.0] 저장 재시도 설정 (무한 루프 방지 + 지수 백오프)
-const SAVE_RETRY_MAX = 3;
-const SAVE_RETRY_BASE_DELAY_MS = 100; // 100ms → 200ms → 400ms 지수 백오프
+const MAX_CONCURRENCY = 2; // 최대 동시 다운로드 수
 
 // 임시 팝업 창 참조 보관용 맵 (Liveness check 및 재활용 루프 대비)
 const activeWorkers = new Map();
-
-// [v1.27.0] B+C 하이브리드: 처리 락 전담 Set (activeWorkers와 분리)
-const processingSlots = new Set();
-
-// [v1.27.0] 세션 토큰 레지스트리: workerId -> {sessionToken, popupRef, createdAt, lastActivity}
-const sessionRegistry = new Map();
-
 const closedCounts = new Map(); // Track closed counts for liveness check independently to avoid polluting activeWorkers window references
 
 // handleBatchSuccess 진행 중인 아이템 추적 (팝업은 닫혔지만 CBZ/업로드 진행 중)
@@ -222,94 +201,17 @@ const getRawQueue = () => {
   return [];
 };
 
-/**
- * [v1.28.0] 단일 동기 저장 시도 — GM_setValue 1차, localStorage 2차 폴백
- * MV3 대응: GM_setValue가 Promise를 반환하면 .catch로 비동기 재시도 트리거
- * @param {Array} queue 저장할 큐 데이터
- * @returns {boolean} 동기 성공 여부 (MV3 Promise fire-and-forget은 항상 true)
- */
-const trySaveOnce = (queue) => {
-  // 1차: GM_setValue (Tampermonkey 네이티브)
-  if (typeof GM_setValue !== 'undefined') {
-    try {
-      const result = GM_setValue(STORAGE_KEY, queue);
-      // MV3: Promise 반환 시 실패하면 비동기 재시도 스케줄링
-      if (result && typeof result.catch === 'function') {
-        result.catch(err => {
-          console.warn('[TokiSync Queue] MV3 GM_setValue 비동기 실패:', err.message);
-          scheduleRetry(queue, 1);
-        });
-      }
-      return true;
-    } catch (gmErr) {
-      console.warn('[TokiSync Queue] GM_setValue 실패, localStorage 폴백 시도:', gmErr.message);
-    }
-  }
-  // 2차: localStorage 폴백 (GM API 불안정 시 영속성 보존)
-  if (typeof localStorage !== 'undefined') {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
-      return true;
-    } catch (lsErr) {
-      console.error('[TokiSync Queue] localStorage 폴백도 실패:', lsErr.message);
-    }
-  }
-  return false;
-};
-
-/**
- * [v1.28.0] 비동기 재시도 스케줄러 (메인 스레드 비차단)
- * setTimeout 기반 지수 백오프. 완전 실패 시 EventBus로 UI에 알림.
- * @param {Array} queue 저장할 큐 데이터
- * @param {number} attempt 현재 시도 횟수 (1-based)
- */
-const scheduleRetry = (queue, attempt) => {
-  if (attempt > SAVE_RETRY_MAX) {
-    console.error(
-      `[TokiSync Queue] ❌ 치명적: 큐 저장 완전 실패 (${SAVE_RETRY_MAX}회 재시도 모두 실패). 데이터 유실 위험!`
-    );
-    _EventBus_js__WEBPACK_IMPORTED_MODULE_0__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_0__/* .EVT */ .c.STORAGE_FATAL, {
-      key: STORAGE_KEY,
-      dataSize: JSON.stringify(queue).length,
-      retriesExhausted: SAVE_RETRY_MAX
-    });
-    return;
-  }
-
-  const delayMs = SAVE_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-  console.warn(`[TokiSync Queue] 저장 재시도 ${attempt}/${SAVE_RETRY_MAX} (${delayMs}ms 백오프)...`);
-
-  setTimeout(() => {
-    if (trySaveOnce(queue)) {
-      _EventBus_js__WEBPACK_IMPORTED_MODULE_0__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_0__/* .EVT */ .c.UPDATE_PROGRESS);
-      console.log(`[TokiSync Queue] ✅ 저장 재시도 성공 (${attempt}회차)`);
-    } else {
-      scheduleRetry(queue, attempt + 1);
-    }
-  }, delayMs);
-};
-
-/**
- * [v1.28.0] 영속성 큐 저장 — 동기 즉시 시도 + 비동기 재시도 폴백
- *
- * 설계 원칙:
- * - 동기 API 유지 (호출자 변경 불필요: worker-controller 11곳, downloader 4곳, MenuModal 6곳)
- * - GM_setValue 즉시 성공 → 동기 완료 (기존 동작 동일)
- * - GM_setValue 실패 → localStorage 동기 폴백 → 성공 시 즉시 반환
- * - 모두 실패 → setTimeout 기반 비동기 재시도 (메인 스레드 비차단)
- * - MV3 Promise reject → 비동기 재시도 자동 트리거
- * - 완전 실패 → EVT.STORAGE_FATAL 이벤트 발행 (UI 경고 표시 가능)
- *
- * @param {Array} queue 저장할 큐 데이터
- */
 const saveRawQueue = (queue) => {
-  // 동기 즉시 시도 (MV2: 완료, MV3: Promise fire-and-forget)
-  if (trySaveOnce(queue)) {
+  try {
+    if (typeof GM_setValue !== 'undefined') {
+      GM_setValue(STORAGE_KEY, queue);
+    } else if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
+    }
     _EventBus_js__WEBPACK_IMPORTED_MODULE_0__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_0__/* .EVT */ .c.UPDATE_PROGRESS);
-    return;
+  } catch (e) {
+    console.error('[TokiSync Queue] Failed to save queue to storage:', e);
   }
-  // 동기 경로 실패 → 비동기 재시도 시작 (호출자는 즉시 리턴, 블로킹 없음)
-  scheduleRetry(queue, 1);
 };
 
 // 32비트 FNV-1a 해시를 36진수 아스키 문자열로 변환하여 한글 유실 없는 고유 아스키 ID 보장
@@ -328,108 +230,6 @@ function tokiHash(str) {
 const getQueueItemId = (title, episodeNum) => {
   const hashPart = tokiHash(`${title}_${episodeNum}`);
   return `toki_${hashPart}`;
-};
-
-/**
- * [v1.27.2] 디버그 일관성 검증: processingSlots와 sessionRegistry 동기화 확인
- */
-const assertConsistent = (context = '') => {
-  if (processingSlots.size !== sessionRegistry.size) {
-    console.warn(`[Queue] ⚠️ 상태 불일치 감지 (${context}): processingSlots=${processingSlots.size} != sessionRegistry=${sessionRegistry.size}`);
-  }
-};
-
-/**
- * [v1.27.0] 워커 세션 생성: 팝업 열기 직후 호출
- * - processingSlots에 락 등록
- * - sessionRegistry에 메타데이터 저장
- * - activeWorkers에 window 참조 등록 (하위 호환)
- * @param {string} id Queue item ID
- * @param {Window|null} popupRef Window reference (null이면 pre-open 단계)
- * @param {string} sessionToken ipc-broker.registerWorkerOrigin에서 생성한 토큰
- */
-const createWorkerSession = (id, popupRef, sessionToken) => {
-  // 큐 아이템 참조 캐시 (touchSessionActivity 최적화)
-  const queue = getRawQueue();
-  const item = queue.find(i => i.id === id);
-  
-  sessionRegistry.set(id, {
-    sessionToken,
-    popupRef: popupRef || null,
-    createdAt: Date.now(),
-    lastActivity: Date.now(),
-    queueItemRef: item || null
-  });
-  
-  processingSlots.add(id);
-  
-  if (popupRef) {
-    activeWorkers.set(id, popupRef);
-  }
-  
-  assertConsistent('createWorkerSession');
-  console.log(`[Queue]  세션 생성: ${id} → token=${sessionToken.substring(0, 8)}... (activeWorkers=${activeWorkers.size}, processingSlots=${processingSlots.size})`);
-};
-
-/**
- * [v1.27.0] 워커 세션 삭제: 팝업 종료/완료/실패 시 호출
- * @param {string} id Queue item ID
- * @param {string} [reason] 삭제 사유 (로깅용)
- */
-const destroyWorkerSession = (id, reason = 'unknown') => {
-  sessionRegistry.delete(id);
-  processingSlots.delete(id);
-  activeWorkers.delete(id);
-  closedCounts.delete(id);
-  
-  assertConsistent('destroyWorkerSession');
-  console.log(`[Queue] 🗑️ 세션 삭제: ${id} (reason=${reason}) → activeWorkers=${activeWorkers.size}, processingSlots=${processingSlots.size}`);
-};
-
-/**
- * [v1.27.0] 세션 토큰 조회
- */
-const getSessionToken = (id) => {
-  const session = sessionRegistry.get(id);
-  return session?.sessionToken || null;
-};
-
-/**
- * [v1.27.0] 세션 활성 시간 갱신
- * 큐 아이템의 lastActivity도 동기 갱신 (타임아웃 감시 기준값)
- */
-const touchSessionActivity = (id) => {
-  const session = sessionRegistry.get(id);
-  if (session) {
-    session.lastActivity = Date.now();
-  }
-  // [v1.27.2] 큐 아이템의 lastActivity에 직접 갱신 (GM write 불필요)
-  if (session?.queueItemRef) {
-    session.queueItemRef.lastActivity = Date.now();
-  } else {
-    // 폴백: 큐에서 find하여 갱신
-    const queue = getRawQueue();
-    const item = queue.find(i => i.id === id);
-    if (item) {
-      item.lastActivity = Date.now();
-      if (session) {
-        session.queueItemRef = item; // 캐시: 다음 호출부터 find 없이 직접 갱신
-      }
-    }
-  }
-};
-
-/**
- * [v1.27.0] 세션의 popupRef 갱신 (pre-open → 실제 연결 전이 시)
- */
-const updateSessionPopupRef = (id, popupRef) => {
-  const session = sessionRegistry.get(id);
-  if (session) {
-    session.popupRef = popupRef;
-  }
-  if (popupRef) {
-    activeWorkers.set(id, popupRef);
-  }
 };
 
 
@@ -470,7 +270,6 @@ const addEpisodesToQueue = (episodes, novelTitle) => {
         matchedRule: ep.matchedRule || {},
         protocolDomain: ep.protocolDomain || '',
         seriesMetadata: ep.seriesMetadata || {},
-        forceOverwrite: ep.forceOverwrite || false,
         status: 'pending',
         progressPercent: 0,
         stage: WORKER_STAGE.INIT,
@@ -543,6 +342,7 @@ const removeQueueItem = (id) => {
   const index = queue.findIndex(item => item.id === id);
   if (index !== -1) {
     const item = queue[index];
+    // 진행 중인 워커인 경우 팝업 즉시 강제 폐쇄 및 맵에서 삭제
     if (item.status === 'processing') {
       const popupRef = activeWorkers.get(id);
       try {
@@ -552,7 +352,8 @@ const removeQueueItem = (id) => {
       } catch (e) {
         console.warn(`[Queue] 개별 삭제 중 자식 팝업 close 실패: ${id}`, e);
       }
-      destroyWorkerSession(id, 'item_removed');
+      activeWorkers.delete(id);
+      closedCounts.delete(id);
     }
     
     const filtered = queue.filter(q => q.id !== id);
@@ -648,6 +449,7 @@ const setQueuePaused = (paused) => {
 const stopAllWorkers = (shouldClear = false) => {
   console.log(`[Queue] ⏹️ 모든 활성 자식 팝업 강제 폐쇄 및 수집 중단 집행... (초기화 여부: ${shouldClear})`);
   
+  // 1. 모든 팝업 창 닫기 (EMERGENCY_STOP 전파 후 100ms 대기)
   for (const [id, popupRef] of activeWorkers.entries()) {
     try {
       if (popupRef && !popupRef.closed) {
@@ -667,8 +469,6 @@ const stopAllWorkers = (shouldClear = false) => {
   }
   activeWorkers.clear();
   closedCounts.clear();
-  processingSlots.clear();
-  sessionRegistry.clear();
 
   // 2. 큐 대기열 전체 청소 및 중단 마킹 (1회성 트랜잭션 병합으로 레이스 컨디션 제거)
   if (shouldClear) {
@@ -716,13 +516,9 @@ const runSchedulerOnce = async () => {
     isSchedulerRunning = false;
     return;
   }
-  if (isSchedulerRunning) {
-    console.log(`[Queue Scheduler] 🔄 runSchedulerOnce 중복진입 차단 (processingSlots=${processingSlots.size})`);
-    return;
-  }
+  if (isSchedulerRunning) return;
   isSchedulerRunning = true;
-  console.log(`[Queue Scheduler] 🔍 runSchedulerOnce 진입 (processingSlots=${processingSlots.size}, _activeProcessing=${_activeProcessing.size}, queue_statuses=[${getRawQueue().map(i=>i.status).join(',')}])`);
-  assertConsistent('runSchedulerOnce');
+  console.log(`[Queue Scheduler] 🔍 runSchedulerOnce 진입 (activeWorkers=${activeWorkers.size}, _activeProcessing=${_activeProcessing.size})`);
 
   try {
     const queue = getRawQueue();
@@ -730,12 +526,14 @@ const runSchedulerOnce = async () => {
     // Liveness Check: 실제 열려있는 팝업 중 닫힌 팝업이 있는지 감지하여 failed 전이
     for (const [id, popupRef] of activeWorkers.entries()) {
       if (popupRef && popupRef.closed) {
+        // 일시적인 closed 레이스 컨디션 방지를 위한 유예 카운트 (연속 3회 감지 시 강제 폐쇄 확정)
         const closedCount = (closedCounts.get(id) || 0) + 1;
         closedCounts.set(id, closedCount);
 
         if (closedCount >= 3) {
-          console.warn(`[Queue Scheduler] ⚠️ 자식 팝업 비정상 종료 확정 (연속 3회 감지): ${id} → activeWorkers 크기=${activeWorkers.size}`);
-          destroyWorkerSession(id, 'popup_closed_3x');
+          console.warn(`[Queue Scheduler] ⚠️ 자식 팝업 비정상 종료 확정 (연속 3회 감지): ${id}`);
+          activeWorkers.delete(id);
+          closedCounts.delete(id);
           const item = queue.find(i => i.id === id);
           if (item && item.status === 'processing') {
             const nextRetry = item.retryCount + 1;
@@ -749,12 +547,13 @@ const runSchedulerOnce = async () => {
           console.log(`[Queue Scheduler] 🛡️ 자식 팝업 일시적 closed 감지 유예 중 (${closedCount}/3): ${id}`);
         }
       } else {
+        // 정상 기동 확인 시 유예 카운터 즉시 리셋
         closedCounts.set(id, 0);
       }
     }
 
-    // 1. 현재 수집 중인 활성 팝업(processingSlots) 또는 진행 중인 작업(_activeProcessing) 제약
-    if (processingSlots.size >= 1 || _activeProcessing.size >= 1) {
+    // 1. 현재 수집 중인 활성 팝업(activeWorkers) 또는 진행 중인 작업(_activeProcessing) 제약
+    if (activeWorkers.size >= 1 || _activeProcessing.size >= 1) {
       isSchedulerRunning = false;
       return;
     }
@@ -769,6 +568,7 @@ const runSchedulerOnce = async () => {
     // 3. pending(대기 중) 상태인 첫 번째 에피소드 추출
     const nextItem = queue.find(item => item.status === 'pending');
     if (!nextItem) {
+      // 대기 중인 작업도 없고 현재 진행 중인 활성 작업도 없다면 안티 슬립 오디오를 정지시킵니다.
       if (currentProcessing.length === 0) {
         try {
           stopSilentAudio();
@@ -778,9 +578,9 @@ const runSchedulerOnce = async () => {
       return;
     }
 
-    // [v1.21.4] 안전 장치: 이미 processingSlots이 점유하고 있는 아이템이라면 중복 기동 방지 스킵
-    if (processingSlots.has(nextItem.id)) {
-      console.log(`[Queue Scheduler] 🛡️ 중복 기동 우회: processingSlots에 이미 점유된 에피소드 스킵: ${nextItem.episodeTitle}`);
+    // [v1.21.4] 안전 장치: 이미 activeWorkers가 점유하고 있는 아이템이라면 중복 기동 방지 스킵
+    if (activeWorkers.has(nextItem.id)) {
+      console.log(`[Queue Scheduler] 🛡️ 중복 기동 우회: activeWorkers에 이미 점유된 에피소드 스킵: ${nextItem.episodeTitle}`);
       isSchedulerRunning = false;
       return;
     }
@@ -788,6 +588,7 @@ const runSchedulerOnce = async () => {
     // 4. 인간 행동 모사를 위한 2.0초~4.0초 랜덤 지연 완충
     console.log(`[Queue Scheduler] 🛡️ 안전 지연 대기 시작 (Target: ${nextItem.episodeTitle})`);
     
+    // 배치 수집 기동을 위해 안티 슬립 기동
     try {
       startSilentAudio();
     } catch (e) {}
@@ -804,49 +605,22 @@ const runSchedulerOnce = async () => {
     }
 
     // 5. 최종 가드: 아직 처리 중인 작업이 있거나 활성 팝업이 있으면 기동 취소
-    if (_activeProcessing.size >= 1 || processingSlots.size >= 1) {
-      console.log(`[Queue Scheduler] 🛡️ 활성 처리/팝업 감지로 기동 취소: ${nextItem.episodeTitle} (activeProcessing=${_activeProcessing.size}, processingSlots=${processingSlots.size})`);
+    if (_activeProcessing.size >= 1 || activeWorkers.size >= 1) {
+      console.log(`[Queue Scheduler] 🛡️ 활성 처리/팝업 감지로 기동 취소: ${nextItem.episodeTitle} (activeProcessing=${_activeProcessing.size}, activeWorkers=${activeWorkers.size})`);
       isSchedulerRunning = false;
       return;
     }
 
-    // [v1.27.2] 좀비 팝업 가드: 동일 ID의 팝업이 아직 살아있는지 확인
-    const zombiePopup = activeWorkers.get(nextItem.id);
-    if (zombiePopup) {
-      const actualRef = zombiePopup.ref || zombiePopup;
-      if (actualRef && !actualRef.closed) {
-        console.warn(`[Queue Scheduler] ⚠️ 기존 팝업 생존 확인 → 중복 기동 차단: ${nextItem.id}`);
-        isSchedulerRunning = false;
-        return;
-      }
-      console.log(`[Queue Scheduler] 🧹 좀비 팝업 참조 정리 (closed): ${nextItem.id}`);
-      activeWorkers.delete(nextItem.id);
-    }
-
     // 6. 팝업 실행 및 상태 갱신
-    console.log(`[Queue Scheduler] 🚀 1회성 신규 팝업 기동: ${nextItem.episodeTitle} (${nextItem.episodeUrl}), 현재 processingSlots=${processingSlots.size}, _activeProcessing=${_activeProcessing.size}`);
-    
-    // [v1.27.0] processingSlots 선점 → updateQueueItem → 팝업 생성 순서로 레이스 컨디션 차단
-    console.log(`[Queue Scheduler] 🔒 processingSlots 선점: ${nextItem.episodeTitle} (ID: ${nextItem.id})`);
-    processingSlots.add(nextItem.id);
+    console.log(`[Queue Scheduler] 🚀 1회성 신규 팝업 기동: ${nextItem.episodeTitle} (${nextItem.episodeUrl}), 현재 activeWorkers=${activeWorkers.size}, _activeProcessing=${_activeProcessing.size}`);
     updateQueueItem(nextItem.id, { status: 'processing', startedAt: Date.now() });
     
     const popupRef = openEpisodePopup(nextItem.episodeUrl, nextItem.id);
-        if (popupRef) {
+    if (popupRef) {
         activeWorkers.set(nextItem.id, popupRef);
-        // 세션 토큰은 worker-controller에서 IPC 연결 시 등록
-        sessionRegistry.set(nextItem.id, {
-          sessionToken: null, // WORKER_READY 매칭 시 ipc-broker에서 생성
-          popupRef,
-          createdAt: Date.now(),
-          lastActivity: Date.now(),
-          queueItemRef: nextItem // 큐 배열 참조 (touchSessionActivity 최적화)
-        });
-        console.log(`[Queue Scheduler] ✅ 팝업 등록 완료: ${nextItem.episodeTitle} (ID: ${nextItem.id}, activeWorkers.size=${activeWorkers.size})`);
+        console.log(`[Queue Scheduler] ✅ 팝업 등록 완료: ${nextItem.episodeTitle} (activeWorkers=${activeWorkers.size})`);
     } else {
-        console.log(`[Queue Scheduler] 🧹 activeWorkers 해제 (팝업 실패): ${nextItem.id}`);
-        processingSlots.delete(nextItem.id);
-        sessionRegistry.delete(nextItem.id);
+        // 팝업 차단 등으로 창 생성 실패 시 즉시 failed 처리
         updateQueueItem(nextItem.id, { 
             status: 'failed', 
             errorMsg: '브라우저 팝업 차단막에 의해 창 생성에 실패했습니다.' 
@@ -923,8 +697,6 @@ const initQueueScheduler = () => {
         }
         activeWorkers.clear();
         closedCounts.clear();
-        processingSlots.clear();
-        sessionRegistry.clear();
       }
     });
     console.log('[TokiSync Queue] 🚦 이벤트 기반(Event-Driven) 고성능 스케줄러가 활성화되었습니다.');
@@ -953,8 +725,6 @@ const initQueueScheduler = () => {
         }
         activeWorkers.clear();
         closedCounts.clear();
-        processingSlots.clear();
-        sessionRegistry.clear();
       }
     }, 1000);
     console.warn('[TokiSync Queue] ⚠️ GM_addValueChangeListener 미지원 환경. 2초 폴링 스케줄러로 기동합니다.');
@@ -1180,22 +950,6 @@ class SubscriptionManager {
 
 let cachedToken = null;
 let tokenExpiry = 0;
-let tokenFetchPromise = null; // [v1.27.3] 토큰 fetch 뮤텍스: 동시 요청 경합 방지
-
-/**
- * [v1.28.0] 업로드 직렬화 락: 동일 파일명 동시 업로드 → Drive 중복 파일 생성 방지
- * Map<fileName, Promise> — 동일 키에 대한 동시 호출은 기존 Promise 재사용
- */
-const uploadLocks = new Map();
-
-function withUploadLock(fileName, fn) {
-    if (uploadLocks.has(fileName)) {
-        return uploadLocks.get(fileName);
-    }
-    const promise = fn().finally(() => uploadLocks.delete(fileName));
-    uploadLocks.set(fileName, promise);
-    return promise;
-}
 
 /**
  * Fetches OAuth token from GAS server
@@ -1205,6 +959,7 @@ async function fetchToken() {
     const config = (0,_config_js__WEBPACK_IMPORTED_MODULE_0__/* .getConfig */ .zj)();
     
     console.log('[DirectUpload] Fetching token from GAS...');
+    console.log('[DirectUpload] GAS URL:', config.gasUrl);
     
     return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
@@ -1220,9 +975,11 @@ async function fetchToken() {
             timeout: 30000,
             onload: (response) => {
                 console.log('[DirectUpload] Token response status:', response.status);
+                console.log('[DirectUpload] Token response text:', response.responseText);
                 
                 try {
                     const result = JSON.parse(response.responseText);
+                    console.log('[DirectUpload] Parsed result:', result);
                     
                     if (result.status === 'success') {
                         console.log('[DirectUpload] Token received successfully');
@@ -1235,6 +992,7 @@ async function fetchToken() {
                     }
                 } catch (e) {
                     console.error('[DirectUpload] JSON parse error:', e);
+                    console.error('[DirectUpload] Raw response:', response.responseText);
                     reject(new Error(`Token parse error: ${e.message}`));
                 }
             },
@@ -1259,12 +1017,6 @@ async function fetchToken() {
 async function getToken() {
     const now = Date.now();
     
-    // [v1.27.3] 토큰 뮤텍스: 이미 fetch 중인 Promise가 있으면 재사용
-    if (tokenFetchPromise) {
-        console.log('[DirectUpload] Token fetch in progress, waiting...');
-        return tokenFetchPromise;
-    }
-    
     // Return cached token if still valid (with 5min safety margin)
     if (cachedToken && tokenExpiry > now + 300000) {
         console.log('[DirectUpload] Using cached token');
@@ -1272,30 +1024,10 @@ async function getToken() {
     }
     
     console.log('[DirectUpload] Fetching new token...');
-    tokenFetchPromise = fetchToken().then(token => {
-        cachedToken = token;
-        tokenExpiry = now + 3600000; // 1 hour
-        tokenFetchPromise = null;
-        return token;
-    }).catch(err => {
-        tokenFetchPromise = null;
-        throw err;
-    });
+    cachedToken = await fetchToken();
+    tokenExpiry = now + 3600000; // 1 hour
     
-    return tokenFetchPromise;
-}
-
-/**
- * [v1.27.3] 토큰 TTL 확인 및 필요 시 갱신. 청크 업로드 전 호출.
- * @returns {Promise<string>} Access token (fresh or cached)
- */
-async function ensureFreshToken() {
-    const now = Date.now();
-    // 남은 TTL이 5분 미만이면 refresh (업로드 도중 만료 방지)
-    if (cachedToken && tokenExpiry > now + 300000) {
-        return cachedToken;
-    }
-    return getToken();
+    return cachedToken;
 }
 
 /**
@@ -1425,7 +1157,7 @@ async function getOrCreateThumbnailFolder(token, parentId) {
  * Sends data in chunks to a Google Drive Resumable Upload session
  */
 async function sendResumableChunks(uploadUrl, blob, token, fileName) {
-    const CHUNK_SIZE = 5 * 1024 * 1024;
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB (Minimum for Drive is 256KB, 5MB is standard)
     const totalSize = blob.size;
     let start = 0;
 
@@ -1433,78 +1165,52 @@ async function sendResumableChunks(uploadUrl, blob, token, fileName) {
         const end = Math.min(start + CHUNK_SIZE, totalSize);
         const chunk = blob.slice(start, end);
         const contentRange = `bytes ${start}-${end - 1}/${totalSize}`;
-
-        // [v1.27.3]  각 청크 전 토큰 TTL 확인 → 만료 임박 시 갱신
-        const freshToken = await ensureFreshToken();
-
-        // [v1.27.3] 청크 재시도 루프 (최대 3회, 지수 백오프)
-        let lastError = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            if (attempt > 1) {
-                const delay = Math.min(2000 * Math.pow(2, attempt - 2), 10000);
-                console.log(`[Chunk] 재시도 ${attempt}/3: ${(delay/1000).toFixed(1)}초 대기 후 재전송 (${contentRange})`);
-                await new Promise(r => setTimeout(r, delay));
-            }
-
-            try {
-                await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: 'PUT',
-                        url: uploadUrl,
-                        headers: {
-                            'Authorization': `Bearer ${freshToken}`,
-                            'Content-Range': contentRange,
-                            'Content-Type': blob.type || 'application/octet-stream'
-                        },
-                        data: chunk,
-                        binary: true,
-                        timeout: 300000,
-                        onload: (res) => {
-                            if (res.status === 308 || (res.status >= 200 && res.status < 300)) {
-                                // [v1.27.3] 308 응답 시 Range 헤더로 실제 수신 위치 확인
-                                if (res.status === 308 && res.responseHeaders) {
-                                    const rangeMatch = res.responseHeaders.match(/range:\s*bytes=0-(\d+)/i);
-                                    if (rangeMatch) {
-                                        const receivedEnd = parseInt(rangeMatch[1], 10) + 1;
-                                        if (receivedEnd > start) {
-                                            start = receivedEnd;
-                                        }
-                                    }
-                                }
-                                resolve();
-                            } else {
-                                _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, { msg: `[${fileName}] 청크 업로드 실패 (${res.status})`, level: 'error', tag: 'Upload' });
-                                reject(new Error(`Chunk upload failed: ${res.status}`));
-                            }
-                        },
-                        onerror: () => reject(new Error('Chunk upload network error')),
-                        ontimeout: () => reject(new Error(`Chunk upload timed out: ${contentRange}`))
-                    });
-                });
-
-                start = end;
-                lastError = null;
-                break;
-            } catch (err) {
-                lastError = err;
-                if (attempt < 3) {
-                    console.warn(`[Chunk] 청크 실패 (${attempt}/3), 재시도: ${err.message}`);
-                } else {
-                    console.error(`[Chunk] 청크 실패 (3/3): ${err.message}`);
-                    _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, { msg: `[${fileName}] 청크 업로드 3회 실패`, level: 'error', tag: 'Upload' });
-                    throw lastError;
-                }
-            }
-        }
+        
+        await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'PUT',
+                url: uploadUrl,
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Range': contentRange,
+                    'Content-Type': blob.type || 'application/octet-stream'
+                },
+                data: chunk,
+                binary: true,
+                timeout: 300000, // 5 minutes per chunk
+                onload: (res) => {
+                    if (res.status === 308) {
+                        // Resume Incomplete (Standard Response for chunks)
+                        resolve();
+                    } else if (res.status >= 200 && res.status < 300) {
+                        // Done (Final chunk)
+                        resolve();
+                    } else {
+                        reject(new Error(`Chunk upload failed: ${res.status} ${res.responseText}`));
+                    }
+                },
+                onerror: reject,
+                ontimeout: () => reject(new Error(`Chunk upload timed out: ${contentRange}`))
+            });
+        });
+        
+        start = end;
+        const progress = Math.min(100, Math.floor((start / totalSize) * 100));
+        console.log(`[DirectUpload] ${fileName} -> ${progress}% (${start}/${totalSize})`);
+        _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, {
+            msg: `☁️ [${fileName}] Drive 업로드 중... ${progress}% (${Math.floor(start / 1024 / 1024)}MB / ${Math.floor(totalSize / 1024 / 1024)}MB)`,
+            level: 'info',
+            tag: 'Upload'
+        });
     }
 }
+
+/**
+ * Uploads file directly to Google Drive using Resumable Upload (5MB Chunks)
+ */
 async function uploadDirect(blob, folderName, fileName, metadata = {}) {
     try {
-        const { forceOverwrite = false } = metadata;
-        if (forceOverwrite) {
-            console.log(`[DirectUpload] Force overwrite mode: ${fileName}`);
-        }
-        _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, { msg: `☁️ [${fileName}] Drive 직접 업로드 준비 중... (${(blob.size / 1024 / 1024).toFixed(1)}MB)`, level: 'info', tag: 'Upload' });
+        console.log(`[DirectUpload] Preparing: ${fileName} (${blob.size} bytes)`);
         
         const config = (0,_config_js__WEBPACK_IMPORTED_MODULE_0__/* .getConfig */ .zj)();
         const token = await getToken();
@@ -1534,105 +1240,89 @@ async function uploadDirect(blob, folderName, fileName, metadata = {}) {
             }
         }
 
-        // 3+4. [v1.28.0] Search + Session Init under per-filename lock (prevents duplicate Drive files)
-        const { existingFileId, uploadUrl } = await withUploadLock(finalFileName, async () => {
-            // 3. Search for existing file to decide POST (New) or PATCH (Update)
-            let existingFileId = null;
-            try {
-                const q = `name='${finalFileName.replace(/'/g, "\\'")}' and '${targetFolderId}' in parents and trashed=false`;
-                const searchUrl = `https://www.googleapis.com/drive/v3/files?` +
-                    `q=${encodeURIComponent(q)}` +
-                    `&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true`;
-
-                const searchRes = await new Promise((res, rej) => {
-                    GM_xmlhttpRequest({
-                        method: 'GET', url: searchUrl,
-                        headers: { 'Authorization': `Bearer ${token}` },
-                        timeout: 30000,
-                        onload: (r) => res(JSON.parse(r.responseText)),
-                        onerror: rej
-                    });
+        // 3. Search for existing file to decide POST (New) or PATCH (Update)
+        let existingFileId = null;
+        try {
+            const q = `name='${finalFileName.replace(/'/g, "\\'")}' and '${targetFolderId}' in parents and trashed=false`;
+            const searchUrl = `https://www.googleapis.com/drive/v3/files?` +
+                `q=${encodeURIComponent(q)}` +
+                `&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true`;
+            
+            const searchRes = await new Promise((res, rej) => {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: searchUrl,
+                    headers: { 'Authorization': `Bearer ${token}` },
+                    timeout: 30000,
+                    onload: (r) => res(JSON.parse(r.responseText)),
+                    onerror: rej
                 });
-
-                if (searchRes.files && searchRes.files.length > 0) {
-                    existingFileId = searchRes.files[0].id;
-                    _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, { msg: `📎 [${fileName}] 기존 파일 발견 → 업데이트(PATCH) 모드`, level: 'info', tag: 'Upload' });
-                }
-            } catch (searchErr) {
-                console.warn('[DirectUpload] Existing file check failed:', searchErr);
-                throw new Error('기존 파일 검색 실패: ' + searchErr.message);
+            });
+            
+            if (searchRes.files && searchRes.files.length > 0) {
+                existingFileId = searchRes.files[0].id;
+                console.log(`[DirectUpload] Existing file found: ${existingFileId} (Mode: UPDATE)`);
             }
+        } catch (searchErr) {
+            console.warn('[DirectUpload] Existing file check failed:', searchErr);
+        }
 
-            // 4. Initialize Resumable Session
-            let uploadUrl = "";
-            const sessionMetadata = {
-                name: finalFileName,
-                parents: existingFileId ? undefined : [targetFolderId]
-            };
+        // 4. Initialize Resumable Session
+        let uploadUrl = "";
+        const sessionMetadata = {
+            name: finalFileName,
+            parents: existingFileId ? undefined : [targetFolderId]
+        };
 
-            const sessionUrl = existingFileId
-                ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=resumable&supportsAllDrives=true`
-                : `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true`;
+        const sessionUrl = existingFileId 
+            ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=resumable&supportsAllDrives=true`
+            : `https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true`;
 
-            // [v1.27.3] 세션 초기화 재시도 (최대 2회, anonymous true → false fallback)
-            uploadUrl = await (async () => {
-                for (let attempt = 1; attempt <= 2; attempt++) {
-                    const useAnonymous = (attempt === 1); // 1회차만 anonymous: true
-
-                    try {
-                        return await new Promise((resolve, reject) => {
-                            GM_xmlhttpRequest({
-                                method: existingFileId ? 'PATCH' : 'POST',
-                                url: sessionUrl,
-                                anonymous: useAnonymous,
-                                headers: {
-                                    'Authorization': `Bearer ${token}`,
-                                    'Content-Type': 'application/json; charset=UTF-8',
-                                    'X-Upload-Content-Type': blob.type || 'application/octet-stream',
-                                    'X-Upload-Content-Length': blob.size.toString()
-                                },
-                                data: JSON.stringify(sessionMetadata),
-                                timeout: 30000,
-                                onload: (res) => {
-                                    if (res.status >= 200 && res.status < 300) {
-                                        const locationMatch = res.responseHeaders.match(/location:\s*([^\r\n]+)/i);
-                                        const uploadIdMatch = res.responseHeaders.match(/x-guploader-uploadid:\s*([^\r\n]+)/i);
-
-                                        if (locationMatch && locationMatch[1]) {
-                                            resolve(locationMatch[1].trim());
-                                        } else if (uploadIdMatch && uploadIdMatch[1]) {
-                                            const sessionUri = new URL(sessionUrl);
-                                            sessionUri.searchParams.set('upload_id', uploadIdMatch[1].trim());
-                                            resolve(sessionUri.toString());
-                                        } else {
-                                            reject(new Error(`Session URL extraction failed`));
-                                        }
-                                    } else {
-                                        reject(new Error(`Session init failed with status: ${res.status}`));
-                                    }
-                                },
-                                onerror: () => reject(new Error('Session init network error'))
-                            });
-                        });
-                    } catch (err) {
-                        if (attempt >= 2) throw err;
-                        console.warn(`[DirectUpload] 세션 초기화 ${attempt}회 실패, 재시도: ${err.message}`);
-                        await new Promise(r => setTimeout(r, 2000));
+        uploadUrl = await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: existingFileId ? 'PATCH' : 'POST',
+                url: sessionUrl,
+                anonymous: true, // Bypass CORS Origin header to ensure Location header is visible
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                    'X-Upload-Content-Type': blob.type || 'application/octet-stream',
+                    'X-Upload-Content-Length': blob.size.toString()
+                },
+                data: JSON.stringify(sessionMetadata),
+                timeout: 30000,
+                onload: (res) => {
+                    if (res.status >= 200 && res.status < 300) {
+                        const locationMatch = res.responseHeaders.match(/location:\s*([^\r\n]+)/i);
+                        const uploadIdMatch = res.responseHeaders.match(/x-guploader-uploadid:\s*([^\r\n]+)/i);
+                        
+                        if (locationMatch && locationMatch[1]) {
+                            resolve(locationMatch[1].trim());
+                        } else if (uploadIdMatch && uploadIdMatch[1]) {
+                            // Fallback: Manually build URI if Location is stripped by CORS
+                            const sessionUri = new URL(sessionUrl);
+                            sessionUri.searchParams.set('upload_id', uploadIdMatch[1].trim());
+                            resolve(sessionUri.toString());
+                        } else {
+                            console.error('[DirectUpload] Response Headers:', res.responseHeaders);
+                            console.error('[DirectUpload] Response Body:', res.responseText);
+                            reject(new Error(`Failed to extract session URL. Headers: ${res.responseHeaders}`));
+                        }
+                    } else {
+                        reject(new Error(`Session init failed with status: ${res.status}`));
                     }
-                }
-                throw new Error('Session init failed after 2 attempts');
-            })();
-
-            return { existingFileId, uploadUrl };
+                },
+                onerror: reject
+            });
         });
 
         // 5. Send chunks
         await sendResumableChunks(uploadUrl, blob, token, finalFileName);
-        _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, { msg: `✅ [${finalFileName}] Drive 업로드 완료!`, level: 'success', tag: 'Upload' });
+        console.log(`[DirectUpload] ✅ Upload successful: ${finalFileName}`);
         return;
 
     } catch (error) {
-        _EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_1__/* .EVT */ .c.LOG, { msg: `❌ [${fileName}] Drive 업로드 실패: ${error.message}`, level: 'error', tag: 'Upload' });
+        console.error(`[DirectUpload] Error:`, error);
+        _logger_js__WEBPACK_IMPORTED_MODULE_2__.logger.error(`[DirectUpload] ${error.message}`, 'Network:Upload');
         throw error;
     }
 }
@@ -2308,6 +1998,14 @@ class GenericParser extends BaseParser {
         // Reverse if it's a typical episode list where latest is on top but we need chronological for some logic?
         // Actually, TokiParser reverses. Let's check if we should always reverse.
         // For now, return as is.
+        
+        console.log("===== GenericParser =====");
+        console.log("container :", listCfg.container);
+        console.log("item :", listCfg.item);
+        console.log("count :", items.length);
+        console.log(items);
+
+
         return items;
     }
 
@@ -2658,8 +2356,7 @@ async function uploadViaGASRelay(blob, folderName, fileName, options = {}) {
                 folderName: folderName, 
                 fileName: fileName,
                 category: category,
-                apiKey: config.apiKey,
-                forceOverwrite: options.forceOverwrite || false
+                apiKey: config.apiKey
             }),
             headers: { "Content-Type": "text/plain" },
             timeout: 30000,
@@ -2674,8 +2371,8 @@ async function uploadViaGASRelay(blob, folderName, fileName, options = {}) {
                         reject(new Error(json.body || "Init failed"));
                     }
                 } catch (e) { 
-                    _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 서버 응답 파싱 실패 (Init) — ${fileName}`, 'GAS:Relay');
-                    reject(new Error("GAS 응답 오류(Init)")); 
+                    _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 서버 응답 파싱 실패 (Init): ${res.responseText?.substring(0, 80)}`, 'GAS:Relay');
+                    reject(new Error("GAS 응답 오류(Init): " + res.responseText)); 
                 }
             },
             onerror: (e) => {
@@ -2693,12 +2390,11 @@ async function uploadViaGASRelay(blob, folderName, fileName, options = {}) {
 
     // 2. Chunk Upload Loop
     let start = 0;
+    const buffer = await blob.arrayBuffer();
     
     while (start < totalSize) {
         const end = Math.min(start + CHUNK_SIZE, totalSize);
-        // [v1.27.3] blob.arrayBuffer() 대신 blob.slice()로 직접 청크 변환 (메모리 최적화)
-        const chunkBlob = blob.slice(start, end);
-        const chunkBuffer = await chunkBlob.arrayBuffer();
+        const chunkBuffer = buffer.slice(start, end);
         const chunkBase64 = (0,_utils_js__WEBPACK_IMPORTED_MODULE_4__/* .arrayBufferToBase64 */ .Yi)(chunkBuffer);
         const percentage = Math.floor((end / totalSize) * 100);
         
@@ -2709,68 +2405,45 @@ async function uploadViaGASRelay(blob, folderName, fileName, options = {}) {
             tag: 'Upload'
         });
 
-        // [v1.27.3] GAS 청크 재시도 루프 (최대 3회)
-        let chunkSuccess = false;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            if (attempt > 1) {
-                const delay = Math.min(2000 * Math.pow(2, attempt - 2), 10000);
-                _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.log(`[GAS] 청크 재시도 ${attempt}/3 (${(delay/1000).toFixed(1)}초 후): ${start}~${end}`, 'GAS:Relay');
-                await new Promise(r => setTimeout(r, delay));
-            }
-            
-            try {
-                await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: "POST", 
-                        url: config.gasUrl,
-                        data: JSON.stringify({ 
-                            folderId: config.folderId, 
-                            type: "upload", 
-                            protocolVersion: 3,
-                            clientVersion: CLIENT_VERSION, 
-                            uploadUrl: uploadUrl, 
-                            chunkData: chunkBase64, 
-                            start: start, end: end, total: totalSize,
-                            apiKey: config.apiKey
-                        }),
-                        headers: { "Content-Type": "text/plain" },
-                        timeout: 300000,
-                        onload: (res) => {
-                            try { 
-                                const json = JSON.parse(res.responseText); 
-                                if (json.status === 'success') resolve(); 
-                                else {
-                                    _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 업로드 실패: ${json.body || 'Upload failed'} (${start}~${end})`, 'GAS:Relay');
-                                    reject(new Error(json.body || "Upload failed")); 
-                                }
-                            } catch (e) { 
-                                _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 응답 파싱 실패 (${start}~${end})`, 'GAS:Relay');
-                                reject(new Error("GAS 응답 오류(Upload)")); 
-                            }
-                        },
-                        onerror: (e) => {
-                            _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 네트워크 오류 (${start}~${end} / ${totalSize})`, 'GAS:Relay');
-                            reject(new Error("네트워크 오류(Upload)"));
-                        },
-                        ontimeout: () => {
-                            _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 타임아웃 5분 (${start}~${end} / ${totalSize})`, 'GAS:Relay');
-                            reject(new Error(`[GAS] 청크 업로드 타임아웃 (5분): ${start}~${end}`));
+        await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST", 
+                url: config.gasUrl,
+                data: JSON.stringify({ 
+                    folderId: config.folderId, 
+                    type: "upload", 
+                    protocolVersion: 3,
+                    clientVersion: CLIENT_VERSION, 
+                    uploadUrl: uploadUrl, 
+                    chunkData: chunkBase64, 
+                    start: start, end: end, total: totalSize,
+                    apiKey: config.apiKey
+                }),
+                headers: { "Content-Type": "text/plain" },
+                timeout: 300000,
+                onload: (res) => {
+                    try { 
+                        const json = JSON.parse(res.responseText); 
+                        if (json.status === 'success') resolve(); 
+                        else {
+                            _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 업로드 실패: ${json.body || 'Upload failed'} (${start}~${end})`, 'GAS:Relay');
+                            reject(new Error(json.body || "Upload failed")); 
                         }
-                    });
-                });
-                chunkSuccess = true;
-                break; // 성공 → 재시도 루프 탈출
-            } catch (err) {
-                if (attempt >= 3) {
-                    _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 3회 실패 (${start}~${end}): ${err.message}`, 'GAS:Relay');
-                    throw err;
+                    } catch (e) { 
+                        _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 응답 파싱 실패 (${start}~${end})`, 'GAS:Relay');
+                        reject(new Error("GAS 응답 오류(Upload): " + res.responseText)); 
+                    }
+                },
+                onerror: (e) => {
+                    _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 네트워크 오류 (${start}~${end} / ${totalSize})`, 'GAS:Relay');
+                    reject(new Error("네트워크 오류(Upload)"));
+                },
+                ontimeout: () => {
+                    _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 타임아웃 5분 (${start}~${end} / ${totalSize})`, 'GAS:Relay');
+                    reject(new Error(`[GAS] 청크 업로드 타임아웃 (5분): ${start}~${end}`));
                 }
-            }
-        }
-        if (!chunkSuccess) {
-            _logger_js__WEBPACK_IMPORTED_MODULE_3__.logger.critical(`GAS 청크 업로드 최종 실패 (${start}~${end})`, 'GAS:Relay');
-            throw new Error(`GAS upload failed at ${start}~${end}`);
-        }
+            });
+        });
         
         start = end;
     }
@@ -3036,7 +2709,6 @@ ${tocNav}
 /* harmony import */ var _config_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(899);
 
 
-
 /**
  * RuleManager
  * Manages parsing rules from built-in templates and user definitions.
@@ -3044,7 +2716,7 @@ ${tocNav}
 class RuleManager {
     // Built-in sample rules as fallback/templates (Offline Seeding)
     static get _version() {
-        return  true ? "1.27.4" : 0;
+        return  true ? "1.26.4" : 0;
     }
 
     static #builtInRules = [
@@ -3362,6 +3034,9 @@ let isBatchControllerInitialized = false;
 // 🛡️ 배치 폴링 setInterval ID 추적 (중복 초기화 시 이전 인터벌 정리)
 let _batchPollingInterval = null;
 
+// Security: Batch worker nonce tracking (queueId -> nonce)
+const batchWorkerNonces = new Map();
+
 /**
  * Close active single worker popup window
  */
@@ -3370,10 +3045,9 @@ function closeActiveWorker() {
         console.log('[WorkerController] 단일 워커 팝업 세션 수동 폐쇄');
         activeWorkerRef.close();
     }
+    // Security: Clean up nonce and origin registration
     if (activeWorkerId) {
         _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(activeWorkerId);
-        _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .processingSlots */ .PG.delete(activeWorkerId);
-        _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.delete(activeWorkerId);
         (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(activeWorkerId, activeWorkerNonce);
         activeWorkerId = null;
     }
@@ -3715,10 +3389,7 @@ function initBatchWorkerController() {
 
         // 1. 60초(업로드 중인 경우 5분) 이상 무반응인 워커 강제 타임아웃 회수
         queue.forEach(item => {
-            // [v1.27.3] sessionRegistry.lastActivity를 우선 참조 (touchSessionActivity로 갱신되는 최신값)
-            const sessionEntry = _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.get(item.id);
-            const sessionLastActive = sessionEntry?.lastActivity;
-            const lastActive = sessionLastActive || item.lastActivity || item.startedAt;
+            const lastActive = item.lastActivity || item.startedAt;
             if (item.status === 'processing' && lastActive) {
                 const isUploading = (item.stage === _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .WORKER_STAGE */ .WB.UPLOADING);
                 const limit = isUploading ? 300000 : 60000;
@@ -3733,24 +3404,21 @@ function initBatchWorkerController() {
                             actualRef.close();
                         }
                     } catch (e) {}
-                    console.log(`[WorkerController]  activeWorkers 삭제 (타임아웃): ${item.id} → size=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.size-1}`);
-                    
-                    // [v1.27.2] 상태 업데이트 먼저 → 세션 정리 → 스케줄러 순서로 레이스 컨디션 차단
+                    _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(item.id);
+                    batchClosedCounts.delete(item.id);
+                    // Security: Invalidate timed-out worker nonce
+                    const timedOutNonce = batchWorkerNonces.get(item.id);
+                    if (timedOutNonce) {
+                        (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(item.id, timedOutNonce);
+                        batchWorkerNonces.delete(item.id);
+                    }
+
                     const nextRetry = (item.retryCount || 0) + 1;
                     (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(item.id, {
                         status: nextRetry >= 3 ? 'failed' : 'pending',
                         retryCount: nextRetry,
                         errorMsg: `에피소드 ${isUploading ? '업로드' : '수집'} 처리 시간이 ${limitSec}초를 초과하여 타임아웃되었습니다.`
                     });
-                    
-                    const timedOutToken = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getSessionToken */ .mj)(item.id);
-                    if (timedOutToken) {
-                        (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(item.id, timedOutToken);
-                    }
-                    (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .destroyWorkerSession */ .NQ)(item.id, 'timeout');
-                    
-                    // [v1.27.2] 안전 대기 플래그 정리 — 타임아웃 시점
-                    delete window[`tokisync_waiting_${item.id}`];
 
                     _EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EVT */ .c.LOG, {
                         msg: `❌ [배치 타임아웃] [${item.episodeTitle}] ${isUploading ? '업로드' : '수집'} 시간 초과(${limitSec}초). 복구를 단행합니다.`,
@@ -3770,33 +3438,31 @@ function initBatchWorkerController() {
                 batchClosedCounts.set(id, closedCount);
 
                 if (closedCount >= 5) {
-                    console.warn(`[WorkerController] ⚠️ [배치] 자식 팝업 수동 종료 확정: ${id} → activeWorkers.size=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.size}`);
+                    console.warn(`[WorkerController] ⚠️ [배치] 자식 팝업 수동 종료 확정: ${id}`);
+                    _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(id);
                     batchClosedCounts.delete(id);
-                    
+                    // Security: Invalidate manually closed worker nonce
+                    const manualNonce = batchWorkerNonces.get(id);
+                    if (manualNonce) {
+                        (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(id, manualNonce);
+                        batchWorkerNonces.delete(id);
+                    }
+
                     const item = queue.find(i => i.id === id);
                     if (item && item.status === 'processing') {
+                        // [H8] 업로드 중(95%~)이거나 이미 완료된 회차는 팝업 닫힘을 정상 종료로 취급하여 복구 차단
                         if (item.stage === _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .WORKER_STAGE */ .WB.UPLOADING || item.stage === _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .WORKER_STAGE */ .WB.COMPLETED) {
-                            console.log(`[WorkerController] 🛡️ 업로드/완료 단계 팝업 닫힘 무시: ${id}`);
+                            _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(id);
+                            batchClosedCounts.delete(id);
                             return;
                         }
 
-                        // [v1.27.2] 상태 업데이트 먼저 → 세션 정리 → 스케줄러 순서
                         const nextRetry = (item.retryCount || 0) + 1;
                         (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(id, {
                             status: nextRetry >= 3 ? 'failed' : 'pending',
                             retryCount: nextRetry,
                             errorMsg: '자식 팝업 창이 비정상적으로 강제 종료되었습니다.'
                         });
-                        
-                        const manualToken = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getSessionToken */ .mj)(id);
-                        if (manualToken) {
-                            (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(id, manualToken);
-                        }
-                        (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .destroyWorkerSession */ .NQ)(id, 'manual_close');
-                        
-                        // [v1.27.2] 안전 대기 플래그 정리
-                        delete window[`tokisync_waiting_${id}`];
-                        
                         _EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EVT */ .c.LOG, {
                             msg: `❌ [배치 수동종료] [${item.episodeTitle}] 자식 팝업이 종료되어 복구를 단행합니다.`,
                             tag: 'Queue',
@@ -3837,15 +3503,14 @@ function initBatchWorkerController() {
             }
         }
         _queue_js__WEBPACK_IMPORTED_MODULE_2__/* ._activeProcessing */ .xx.add(matchedId);
-        const batchToken = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getSessionToken */ .mj)(matchedId);
-        if (batchToken) {
-            (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(matchedId, batchToken);
+        _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(matchedId);
+        batchClosedCounts.delete(matchedId);
+        // Security: Invalidate batch worker nonce
+        const batchNonce = batchWorkerNonces.get(matchedId);
+        if (batchNonce) {
+            (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(matchedId, batchNonce);
+            batchWorkerNonces.delete(matchedId);
         }
-        (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .destroyWorkerSession */ .NQ)(matchedId, 'collection_complete');
-        console.log(`[WorkerController] 🧹 세션 정리 (수집완료): ${matchedId} → processingSlots=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .processingSlots */ .PG.size}`);
-        
-        // [v1.27.2] 안전 대기 플래그 정리 — 완료 시점
-        delete window[`tokisync_waiting_${matchedId}`];
 
         // [P0] 수집된 무거운 바이너리/본문 데이터는 영속 스토리지 대신 인메모리 캐시에 보관
         extractedDataCache.set(matchedId, {
@@ -3980,8 +3645,7 @@ function initBatchWorkerController() {
                     folderId: item.folderId,
                     folderName: targetFolderName,
                     category: category,
-                    destination: destination,
-                    forceOverwrite: item.forceOverwrite || false
+                    destination: destination
                 });
             } finally {
                 clearInterval(keepalive);
@@ -4025,6 +3689,7 @@ function initBatchWorkerController() {
 
         const popupRef = _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.get(matchedId);
         if (popupRef) {
+            // [자가 종료 가드] 자식이 스스로 닫히는 것을 기다리되, 3초 후에도 열려있다면 부모가 직접 닫고 activeWorkers에서 제거
             setTimeout(() => {
                 try {
                     const actualRef = popupRef.ref || popupRef;
@@ -4033,6 +3698,7 @@ function initBatchWorkerController() {
                         actualRef.close();
                     }
                 } catch (e) {}
+                _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(matchedId);
             }, 3000);
         }
 
@@ -4076,57 +3742,30 @@ function initBatchWorkerController() {
 
         // 1. WORKER_READY: 자식 워커 핸드셰이킹 수신
         if (type === 'WORKER_READY') {
-            const { targetUrl, sessionToken: childToken } = payload || {};
+            const { targetUrl } = payload || {};
             let matchedId = null;
 
-            // [v1.27.0] 1순위: 세션 토큰 매칭 (크로스 오리진 네비게이션 안전)
-            if (childToken) {
-                const tokenWorkerId = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .getWorkerIdByNonce */ .Yv)(childToken);
-                if (tokenWorkerId) {
-                    const session = _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.get(tokenWorkerId);
-                    if (session) {
-                        matchedId = tokenWorkerId;
-                        console.log(`[WorkerController] 🔑 [배치] 세션 토큰 매칭 성공: ${matchedId}`);
-                    }
+            for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
+                const actualRef = popupRef.ref || popupRef;
+                if (actualRef === sourceEvent.source) {
+                    matchedId = id;
+                    break;
                 }
             }
 
-            // 2순위: Window 참조 매칭 (기존 방식, 대부분 정상 동작)
-            if (!matchedId) {
-                for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
-                    const actualRef = popupRef.ref || popupRef;
-                    if (actualRef === sourceEvent.source) {
-                        matchedId = id;
-                        break;
-                    }
-                }
-            }
-
-            // 3순위: URL 매칭 (fallback, 세션 토큰 사전 등록 필요)
             if (!matchedId && targetUrl) {
                 const queue = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueue */ .IS)();
                 const matchedItem = queue.find(item => 
                     (item.status === 'pending' || item.status === 'processing') && 
                     item.episodeUrl === targetUrl
                 );
-                if (matchedItem) {
-                    // 세션 토큰이 없으면 생성 (pre-open 또는 스케줄러에서 미등록된 경우)
-                    let token = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getSessionToken */ .mj)(matchedItem.id);
-                    if (!token) {
-                        token = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .registerWorkerOrigin */ .S6)(matchedItem.id, 'null');
-                        _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.set(matchedItem.id, {
-                            sessionToken: token,
-                            popupRef: sourceEvent.source,
-                            createdAt: Date.now(),
-                            lastActivity: Date.now(),
-                            queueItemRef: matchedItem
-                        });
-                        console.log(`[WorkerController] 🔐 [배치] URL 매칭으로 세션 토큰 신규 생성: ${matchedItem.id}`);
-                    }
+                if (matchedItem && batchWorkerNonces.has(matchedItem.id)) {
                     matchedId = matchedItem.id;
                     _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.set(matchedId, sourceEvent.source);
-                    (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateSessionPopupRef */ .zS)(matchedId, sourceEvent.source);
-                    console.log(`[WorkerController] 🔄 [배치] activeWorkers 갱신 (URL 매칭): ${matchedId}`);
+                    // Security: Register worker origin and generate session nonce for batch
+                    const batchNonce = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .registerWorkerOrigin */ .S6)(matchedId, 'null');
+                    batchWorkerNonces.set(matchedId, batchNonce);
+                    console.log(`[WorkerController] ♻️ URL 매칭 성공 ➡️ Window 참조 복원 갱신 (ID: ${matchedId}), 보안 논스 생성`);
                 }
             }
 
@@ -4137,13 +3776,11 @@ function initBatchWorkerController() {
                 if (item) {
                     // 🛡️ 안전 대기 중 동일 에피소드의 READY 중복 처리 방어 가드
                     if (window[`tokisync_waiting_${matchedId}`]) {
-                        (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .touchSessionActivity */ .xE)(matchedId);
                         console.log(`[WorkerController] [배치] ID: ${matchedId} 는 이미 안전 대기 중입니다. 중복 READY 유입 차단.`);
                         return;
                     }
                     window[`tokisync_waiting_${matchedId}`] = true;
-                    (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(matchedId, { status: 'processing', lastActivity: Date.now() });
-                    (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .touchSessionActivity */ .xE)(matchedId);
+                    (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(matchedId, { lastActivity: Date.now() });
 
                     const config = (0,_config_js__WEBPACK_IMPORTED_MODULE_4__/* .getConfig */ .zj)();
                     const multiplier = _config_js__WEBPACK_IMPORTED_MODULE_4__/* .SLEEP_MULTIPLIERS */ .dx[config.sleepMode] || _config_js__WEBPACK_IMPORTED_MODULE_4__/* .SLEEP_MULTIPLIERS */ .dx.cautious;
@@ -4156,20 +3793,23 @@ function initBatchWorkerController() {
                         level: 'info'
                     });
                     
-                    await new Promise(r => setTimeout(r, initialDelay));
+                    try {
+                        await new Promise(r => setTimeout(r, initialDelay));
+                    } finally {
+                        delete window[`tokisync_waiting_${matchedId}`];
+                    }
                     
-                    // [v1.27.1] 대기 완료 후 중단 여부 재체크
+                    // 대기 완료 후 중단 여부 재체크
                     const freshQueue = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueue */ .IS)();
                     const freshItem = freshQueue.find(i => i.id === matchedId);
                     if (!freshItem || freshItem.status !== 'processing' || (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueuePaused */ .kZ)()) {
-                        console.log(`[WorkerController] ⏹️ 첫 통신 대기 후 중단/일시정지 감지 -> 주입 취소 (ID: ${matchedId}, status=${freshItem?.status}, paused=${(0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueuePaused */ .kZ)()})`);
-                        delete window[`tokisync_waiting_${matchedId}`];
+                        console.log('[WorkerController] ⏹️ 첫 통신 대기 후 중단/일시정지 감지 -> 주입 취소');
                         return;
                     }
 
-                    console.log(`[WorkerController] [배치] 안전 대기 완료 START_EXTRACTION 주입 (ID: ${matchedId})`);
+                    console.log(`[WorkerController] 📢 [배치] 안전 대기 완료 ➡️ START_EXTRACTION 주입 (ID: ${matchedId})`);
                     
-                    const sessionToken = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getSessionToken */ .mj)(matchedId);
+                    const batchNonce = batchWorkerNonces.get(matchedId);
                     (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .sendToWorker */ .eu)(sourceEvent.source, 'START_EXTRACTION', {
                         queueId: item.id,
                         targetType: (item.category === 'Novel' || item.category === 'novel') ? 'novel' : 'comic',
@@ -4183,33 +3823,20 @@ function initBatchWorkerController() {
                         matchedRule: item.matchedRule || {},
                         protocolDomain: item.protocolDomain || window.location.origin,
                         scanSpeedMultiplier: config.scanSpeed / 750,
-                        speedMultiplier: multiplier,
+                        speedMultiplier: multiplier, // 속도 배율 전달
                         localNameTemplate: config.localNameTemplate || "{number:4} - {title}",
-                        sessionNonce: sessionToken
-                    });
-                    // [v1.27.3] sendToWorker에 nonce 미포함: 자식의 _activeNonces는 항상 비어있어
-                    // 메시지가 Blocked 되기 때문. sessionNonce는 payload로만 전달되어
-                    // 자식이 TASK_COMPLETED/TASK_FAILED의 child->parent nonce로 재사용.
-                    
-                    // [v1.27.2] 플래그는 START_EXTRACTION 후에도 유지 — 워커 완료/실패 시점에 정리
+                        sessionNonce: batchNonce // Security: session token for IPC validation
+                    }, batchNonce);
                 }
             } else {
-                console.warn('[WorkerController] [배치] WORKER_READY 수신했으나 매칭되는 활성 세션을 찾지 못했습니다.', targetUrl);
-                console.warn(`[WorkerController] [배치] 디버그: activeWorkers=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.size}, processingSlots=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .processingSlots */ .PG.size}, sessionRegistry=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.size}`);
+                console.warn('[WorkerController] [배치] WORKER_READY 수신했으나 매칭되는 activeWorkers 항목을 찾지 못했습니다.', targetUrl);
             }
         }
 
         // 2. CAPTCHA_DETECTED: WAF/보안 방어막 대기 상태
         if (type === 'CAPTCHA_DETECTED') {
-            const { queueId, sessionToken: captchaToken } = payload || {};
+            const { queueId } = payload || {};
             let matchedId = queueId;
-
-            if (captchaToken && !matchedId) {
-                const tokenWorkerId = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .getWorkerIdByNonce */ .Yv)(captchaToken);
-                if (tokenWorkerId && _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.has(tokenWorkerId)) {
-                    matchedId = tokenWorkerId;
-                }
-            }
 
             if (!matchedId) {
                 for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
@@ -4234,20 +3861,15 @@ function initBatchWorkerController() {
 
         // 2-1. WORKER_LOG: 자식 워커 커스텀 실시간 로그 출력
         if (type === 'WORKER_LOG') {
-            const { msg, level, queueId, sessionToken: logToken } = payload || {};
+            const { msg, level, queueId } = payload || {};
             _EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EVT */ .c.LOG, {
                 msg: msg,
                 tag: 'Worker:Batch',
                 level: level || 'info'
             });
 
+            // [H8] Liveness Jitter 방어: 로그 수신 시 수집 시간(lastActivity)을 갱신하여 60초 배치 타임아웃 오작동 차단
             let matchedId = queueId;
-            if (logToken && !matchedId) {
-                const tokenWorkerId = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .getWorkerIdByNonce */ .Yv)(logToken);
-                if (tokenWorkerId && _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.has(tokenWorkerId)) {
-                    matchedId = tokenWorkerId;
-                }
-            }
             if (!matchedId) {
                 for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
                     const actualRef = popupRef.ref || popupRef;
@@ -4255,23 +3877,14 @@ function initBatchWorkerController() {
                 }
             }
             if (matchedId) {
-                (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .touchSessionActivity */ .xE)(matchedId);
                 (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(matchedId, { lastActivity: Date.now() });
             }
         }
 
         // 3. WORKER_PROGRESS: 자식 워커 실시간 진행률 UI 반영
         if (type === 'WORKER_PROGRESS') {
-            const { percent, stage, queueId, sessionToken: progToken } = payload || {};
+            const { percent, stage, queueId } = payload || {};
             let matchedId = queueId;
-
-            // 세션 토큰으로 매칭 검증
-            if (progToken && !matchedId) {
-                const tokenWorkerId = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .getWorkerIdByNonce */ .Yv)(progToken);
-                if (tokenWorkerId && _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.has(tokenWorkerId)) {
-                    matchedId = tokenWorkerId;
-                }
-            }
 
             if (!matchedId) {
                 for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
@@ -4281,10 +3894,10 @@ function initBatchWorkerController() {
             }
 
             if (matchedId) {
-                (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .touchSessionActivity */ .xE)(matchedId);
                 const queue = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueue */ .IS)();
                 const item = queue.find(i => i.id === matchedId);
                 if (item) {
+                    // 진행률 업데이트 시에도 lastActivity를 현재 시간으로 강제 명시하여 타임아웃을 유예
                     (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(matchedId, { progressPercent: percent, stage: stage, lastActivity: Date.now() });
                     
                     let stageText = '대기 중';
@@ -4324,15 +3937,8 @@ function initBatchWorkerController() {
 
         // 5. TASK_COMPLETED_FALLBACK: GM Storage 폴백 완료
         if (type === 'TASK_COMPLETED_FALLBACK') {
-            const { queueId, sessionToken: fallbackToken } = payload || {};
+            const { queueId } = payload || {};
             let matchedId = queueId;
-
-            if (fallbackToken && !matchedId) {
-                const tokenWorkerId = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .getWorkerIdByNonce */ .Yv)(fallbackToken);
-                if (tokenWorkerId && _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.has(tokenWorkerId)) {
-                    matchedId = tokenWorkerId;
-                }
-            }
 
             if (!matchedId) {
                 for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
@@ -4356,15 +3962,8 @@ function initBatchWorkerController() {
 
         // 6. TASK_FAILED: 예외 및 복구 불능 실패 보고
         if (type === 'TASK_FAILED') {
-            const { errorMsg, queueId, sessionToken: failedToken } = payload || {};
+            const { errorMsg, queueId } = payload || {};
             let matchedId = queueId;
-
-            if (failedToken && !matchedId) {
-                const tokenWorkerId = (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .getWorkerIdByNonce */ .Yv)(failedToken);
-                if (tokenWorkerId && _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .sessionRegistry */ .a.has(tokenWorkerId)) {
-                    matchedId = tokenWorkerId;
-                }
-            }
 
             if (!matchedId) {
                 for (const [id, popupRef] of _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.entries()) {
@@ -4376,11 +3975,27 @@ function initBatchWorkerController() {
             if (matchedId) {
                 console.error(`[WorkerController] ❌ [배치] 수집 실패 (ID: ${matchedId}): ${errorMsg}`);
                 
+                const popupRef = _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.get(matchedId);
+                if (popupRef) {
+                    const actualRef = popupRef.ref || popupRef;
+                    try {
+                        if (actualRef && !actualRef.closed) {
+                            actualRef.close();
+                        }
+                    } catch (e) {}
+                    _queue_js__WEBPACK_IMPORTED_MODULE_2__/* .activeWorkers */ .mR.delete(matchedId);
+                    // Security: Invalidate failed worker nonce
+                    const failedNonce = batchWorkerNonces.get(matchedId);
+                    if (failedNonce) {
+                        (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(matchedId, failedNonce);
+                        batchWorkerNonces.delete(matchedId);
+                    }
+                }
+
                 const queue = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueue */ .IS)();
                 const item = queue.find(i => i.id === matchedId);
-                
-                // [v1.27.2] 상태 업데이트 먼저 → 세션 정리 → 스케줄러 순서
                 if (item) {
+                    // [v1.21.8] 사용자의 정지 클릭으로 이미 failed로 빠졌는지 확인
                     const isStopped = item.status === 'failed' && item.errorMsg?.includes('중단');
                     const nextRetry = (item.retryCount || 0) + 1;
                     (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .updateQueueItem */ .Gg)(matchedId, {
@@ -4390,16 +4005,6 @@ function initBatchWorkerController() {
                     });
                     _EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EventBus */ .l.emit(_EventBus_js__WEBPACK_IMPORTED_MODULE_3__/* .EVT */ .c.UPDATE_PROGRESS);
                 }
-                
-                const sessionToken = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getSessionToken */ .mj)(matchedId);
-                if (sessionToken) {
-                    (0,_ipc_broker_js__WEBPACK_IMPORTED_MODULE_1__/* .removeWorkerOrigin */ .Re)(matchedId, sessionToken);
-                }
-                (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .destroyWorkerSession */ .NQ)(matchedId, 'task_failed');
-                console.log(`[WorkerController] 🧹 세션 정리 (수집패): ${matchedId} → processingSlots=${_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .processingSlots */ .PG.size}`);
-                
-                // [v1.27.2] 안전 대기 플래그 정리
-                delete window[`tokisync_waiting_${matchedId}`];
 
                 // 배치 최종 실패 마감 시 처리
                 const currentQueue = (0,_queue_js__WEBPACK_IMPORTED_MODULE_2__/* .getQueue */ .IS)();
@@ -4642,28 +4247,22 @@ var RuleManager = __webpack_require__(543);
  */
 
 class DomInspector {
-    constructor(options = {}) {
+    constructor() {
         this.root = document.body;
         this.treeData = null;
         this.nodeMap = [];
-        this.elementToNode = new Map();
         this.filterText = '';
         this.onApply = null;
         this.lastSelector = '';
+        this.maxDepth = 12;
         this.selectedNode = null;
-        this.options = {
-            enablePseudo: true,
-            enableShadow: true,
-            maxDepth: 999,
-            ...options
-        };
     }
 
     /**
      * Walk the DOM and build a simplified tree.
      */
     simplify(element, depth = 0) {
-        if (depth > this.options.maxDepth) return null;
+        if (depth > this.maxDepth) return null;
 
         if (element.nodeType === Node.TEXT_NODE) {
             const text = element.textContent.replace(/\s+/g, ' ').trim();
@@ -4674,8 +4273,12 @@ class DomInspector {
         if (element.nodeType !== Node.ELEMENT_NODE) return null;
 
         const tag = element.tagName.toLowerCase();
-        const skip = ['script', 'style'];
+        const skip = ['script','style','link','meta','noscript','iframe','svg','path','br','hr','wbr'];
         if (skip.includes(tag)) return null;
+
+        const rect = element.getBoundingClientRect();
+        const noLayout = rect.width === 0 && rect.height === 0 && tag !== 'img' && tag !== 'input' && tag !== 'br';
+        if (noLayout) return null;
 
         const node = {
             type: 'element',
@@ -4684,11 +4287,10 @@ class DomInspector {
             classes: [],
             attrs: {},
             text: null,
-            hidden: null,
+            hidden: false,
             children: [],
             elementRef: element,
-            matched: false,
-            shadow: false
+            matched: false
         };
 
         for (const c of element.classList) {
@@ -4697,177 +4299,54 @@ class DomInspector {
             }
         }
 
-        // CSS evasion detection
         const style = window.getComputedStyle(element);
-        node.hidden = this._detectHidden(style, element);
+        node.hidden = style.display === 'none' || style.visibility === 'hidden';
 
-        // Collect attributes
-        this._collectAttrs(element, node);
+        const important = ['href','src','data-num','data-src','data-lazy','data-original','alt','title','value','type','name','data-id'];
+        for (const a of important) {
+            const v = element.getAttribute(a);
+            if (v) node.attrs[a] = v.length > 80 ? v.substring(0, 80) + '…' : v;
+        }
 
-        // Process child nodes
+        const directText = element.childNodes.length === 1 && element.childNodes[0].nodeType === Node.TEXT_NODE;
+        const noChildren = element.children.length === 0;
+        if (directText || noChildren) {
+            const t = element.textContent.replace(/\s+/g, ' ').trim();
+            if (t) node.text = t.length > 80 ? t.substring(0, 80) + '…' : t;
+        }
+
         for (const child of element.childNodes) {
             const s = this.simplify(child, depth + 1);
             if (s) node.children.push(s);
         }
 
-        // Pseudo-elements
-        if (this.options.enablePseudo) {
-            this._addPseudoElements(element, node);
-        }
-
-        // Shadow DOM
-        if (this.options.enableShadow && element.shadowRoot) {
-            for (const child of element.shadowRoot.childNodes) {
-                const s = this.simplify(child, depth + 1);
-                if (s) {
-                    s.shadow = true;
-                    node.children.push(s);
-                }
-            }
-        }
-
-        // Collapse single text child
         if (node.children.length === 1 && node.children[0].type === 'text' && !node.text) {
             node.text = node.children[0].value;
             node.children = [];
         }
 
-        // Build reverse index
-        this.elementToNode.set(element, node);
-
         return node;
-    }
-
-    /**
-     * Detect CSS-based hiding/evasion strategies.
-     * Returns a string flag or null.
-     */
-    _detectHidden(style, element) {
-        if (style.display === 'none') return 'display-none';
-        if (style.visibility === 'hidden') return 'visibility-hidden';
-
-        const opacity = parseFloat(style.opacity);
-        if (!isNaN(opacity) && opacity < 0.5) return 'faded';
-
-        const pos = style.position;
-        if (pos === 'absolute' || pos === 'fixed') {
-            const left = parseFloat(style.left);
-            const top = parseFloat(style.top);
-            if (left <= -9999 || top <= -9999) return 'offscreen';
-        }
-
-        const clipPath = style.clipPath || '';
-        if (clipPath.startsWith('inset(50%)')) return 'clipped';
-
-        const fontSize = parseFloat(style.fontSize);
-        if (!isNaN(fontSize) && fontSize === 0) return 'zero-font';
-
-        if (style.pointerEvents === 'none') return 'no-pointer';
-
-        return null;
-    }
-
-    /**
-     * Collect attributes from an element.
-     */
-    _collectAttrs(element, node) {
-        const important = ['href', 'src', 'data-num', 'data-lazy', 'data-original', 'alt', 'title', 'value', 'type', 'name', 'data-id'];
-        for (const a of important) {
-            const v = element.getAttribute(a);
-            if (v) node.attrs[a] = v.length > 80 ? v.substring(0, 80) + '\u2026' : v;
-        }
-
-        // Collect ALL data-* attributes
-        for (const attr of element.attributes) {
-            const name = attr.name;
-            if (name.startsWith('data-') && !node.attrs[name]) {
-                const v = attr.value;
-                node.attrs[name] = v.length > 80 ? v.substring(0, 80) + '\u2026' : v;
-            }
-        }
-
-        // aria-* attributes
-        for (const attr of element.attributes) {
-            if (attr.name.startsWith('aria-')) {
-                const v = attr.value;
-                node.attrs[attr.name] = v.length > 80 ? v.substring(0, 80) + '\u2026' : v;
-            }
-        }
-
-        // Additional single attributes
-        const singles = ['role', 'style', 'loading'];
-        for (const a of singles) {
-            const v = element.getAttribute(a);
-            if (v && !node.attrs[a]) {
-                node.attrs[a] = v.length > 80 ? v.substring(0, 80) + '\u2026' : v;
-            }
-        }
-    }
-
-    /**
-     * Add pseudo-element nodes (::before / ::after).
-     */
-    _addPseudoElements(element, node) {
-        const computed = window.getComputedStyle(element);
-        for (const pseudo of ['::before', '::after']) {
-            const ps = window.getComputedStyle(element, pseudo);
-            if (ps.content && ps.content !== 'none' && ps.content !== 'normal') {
-                node.children.push({
-                    type: 'pseudo',
-                    name: pseudo,
-                    content: ps.content,
-                    hidden: null,
-                    children: []
-                });
-            }
-        }
     }
 
     build() {
         this.nodeMap = [];
-        this.elementToNode = new Map();
         this.treeData = this.simplify(this.root);
     }
 
     /**
      * Render the tree as DevTools-style HTML.
-     * Uses chunked rendering for large trees (>200 nodes).
      */
-    renderTree(container) {
-        this.nodeMap = [];
-        const totalNodes = this._countElementNodes(this.treeData);
-
-        if (totalNodes <= 200) {
-            // Sync render for small trees
-            const html = this._renderTreeSync(this.treeData);
-            container.innerHTML = html;
-            return;
-        }
-
-        // Chunked render for large trees
-        this._renderTreeChunked(container);
-    }
-
-    _countElementNodes(node) {
-        if (!node || node.type === 'text') return 0;
-        let count = 1;
-        for (const child of node.children) {
-            count += this._countElementNodes(child);
-        }
-        return count;
-    }
-
-    _renderTreeSync(node, depth = 0) {
-        if (!node || node.type === 'text') return '';
-        if (node.type === 'pseudo') return this._renderPseudoNode(node, depth);
+    renderTree(node, depth = 0) {
+        if (!node) return '';
+        if (node.type === 'text') return '';
 
         const idx = this.nodeMap.length;
         this.nodeMap.push(node);
         node._idx = idx;
 
-        const hasChildren = node.children.some(c => c.type === 'element' || c.type === 'pseudo');
+        const hasChildren = node.children.some(c => c.type === 'element');
         const expandByDefault = depth < 3;
-        const arrow = hasChildren ? (expandByDefault ? '\u25BC' : '\u25B6') : '  ';
+        const arrow = hasChildren ? (expandByDefault ? '▼' : '▶') : '  ';
 
         const tagHtml = `<span class="di-tag">${node.tag}</span>`;
         const idHtml = node.id ? `<span class="di-id">#${node.id}</span>` : '';
@@ -4880,80 +4359,27 @@ class DomInspector {
         const textHtml = node.text
             ? ` <span class="di-text">"${node.text}"</span>`
             : '';
-        const hiddenClass = node.hidden ? ' di-dimmed' : '';
-        const shadowBadge = node.shadow ? '<span class="di-shadow-badge">\u{1F4A0}</span>' : '';
+        const hiddenAttr = node.hidden ? ' di-dimmed' : '';
 
-        let html = `<div class="di-line${hiddenClass}" data-idx="${idx}" style="padding-left:${depth * 20}px">
+        let html = `<div class="di-line${hiddenAttr}" data-idx="${idx}" style="padding-left:${depth * 20}px">
             <span class="di-arrow">${arrow}</span>
-            ${shadowBadge}${tagHtml}${idHtml}${clsHtml}${attrHtml}${textHtml}
+            ${tagHtml}${idHtml}${clsHtml}${attrHtml}${textHtml}
         </div>`;
 
         if (hasChildren && expandByDefault) {
             const childrenHtml = node.children
-                .filter(c => c.type === 'element' || c.type === 'pseudo')
-                .map(c => this._renderTreeSync(c, depth + 1))
+                .filter(c => c.type === 'element')
+                .map(c => this.renderTree(c, depth + 1))
                 .join('');
             html += `<div class="di-children" data-parent="${idx}">${childrenHtml}</div>`;
         } else if (hasChildren) {
             const childrenHtml = node.children
-                .filter(c => c.type === 'element' || c.type === 'pseudo')
-                .map(c => this._renderTreeSync(c, depth + 1))
+                .filter(c => c.type === 'element')
+                .map(c => this.renderTree(c, depth + 1))
                 .join('');
             html += `<div class="di-children di-collapsed" data-parent="${idx}">${childrenHtml}</div>`;
         }
 
-        return html;
-    }
-
-    _renderTreeChunked(container) {
-        this.nodeMap = [];
-        const batchSize = 100;
-        const pending = [];
-        this._collectRenderQueue(this.treeData, pending, 0);
-
-        let offset = 0;
-        const renderBatch = () => {
-            const batch = pending.slice(offset, offset + batchSize);
-            offset += batch.length;
-
-            for (const { node, depth } of batch) {
-                this.nodeMap.push(node);
-                node._idx = node._idx !== undefined ? node._idx : this.nodeMap.length - 1;
-            }
-
-            if (offset < pending.length) {
-                requestAnimationFrame(renderBatch);
-            } else {
-                // All queued — now build full HTML
-                container.innerHTML = this._renderTreeSync(this.treeData);
-            }
-        };
-
-        requestAnimationFrame(renderBatch);
-    }
-
-    _collectRenderQueue(node, queue, depth) {
-        if (!node || node.type === 'text') return;
-        queue.push({ node, depth });
-        node._idx = queue.length - 1;
-        for (const child of node.children) {
-            if (child.type === 'element' || child.type === 'pseudo') {
-                this._collectRenderQueue(child, queue, depth + 1);
-            }
-        }
-    }
-
-    _renderPseudoNode(node, depth) {
-        const idx = this.nodeMap.length;
-        this.nodeMap.push(node);
-        node._idx = idx;
-
-        const hiddenClass = node.hidden ? ' di-dimmed' : '';
-        let html = `<div class="di-line di-pseudo${hiddenClass}" data-idx="${idx}" style="padding-left:${depth * 20}px">
-            <span class="di-arrow">  </span>
-            <span class="di-pseudo-name">${node.name}</span>
-            <span class="di-text">"${node.content}"</span>
-        </div>`;
         return html;
     }
 
@@ -4962,6 +4388,7 @@ class DomInspector {
         const lower = text.toLowerCase();
         let match = node.tag.includes(lower) ||
             node.classes.some(c => c.includes(lower)) ||
+            (node.text && node.text.toLowerCase().includes(lower)) ||
             Object.values(node.attrs).some(v => v.toLowerCase().includes(lower));
         for (const child of node.children) {
             if (this.filterNodes(child, text)) match = true;
@@ -4972,12 +4399,9 @@ class DomInspector {
 
     renderTreeFiltered(node, depth = 0) {
         if (!node || node.type === 'text') return '';
-        if (node.type === 'pseudo') {
-            return this._renderPseudoNode(node, depth);
-        }
         if (!node.matched) {
             for (const child of node.children) {
-                if ((child.type === 'element' || child.type === 'pseudo') && child.matched) {
+                if (child.type === 'element' && child.matched) {
                     return this.renderTreeFiltered(child, depth);
                 }
             }
@@ -4988,8 +4412,8 @@ class DomInspector {
         this.nodeMap.push(node);
         node._idx = idx;
 
-        const hasVisibleChildren = node.children.some(c => (c.type === 'element' || c.type === 'pseudo') && c.matched);
-        const arrow = hasVisibleChildren ? '\u25BC' : '  ';
+        const hasVisibleChildren = node.children.some(c => c.type === 'element' && c.matched);
+        const arrow = hasVisibleChildren ? '▼' : '  ';
 
         const tagHtml = `<span class="di-tag">${node.tag}</span>`;
         const idHtml = node.id ? `<span class="di-id">#${node.id}</span>` : '';
@@ -5002,16 +4426,16 @@ class DomInspector {
         const textHtml = node.text
             ? ` <span class="di-text">"${node.text}"</span>`
             : '';
-        const hiddenClass = node.hidden ? ' di-dimmed' : '';
+        const hiddenAttr = node.hidden ? ' di-dimmed' : '';
         const matchedAttr = node.matched ? ' di-highlight' : '';
 
-        let html = `<div class="di-line${hiddenClass}${matchedAttr}" data-idx="${idx}" style="padding-left:${depth * 20}px">
+        let html = `<div class="di-line${hiddenAttr}${matchedAttr}" data-idx="${idx}" style="padding-left:${depth * 20}px">
             <span class="di-arrow">${arrow}</span>
             ${tagHtml}${idHtml}${clsHtml}${attrHtml}${textHtml}
         </div>`;
 
         const childrenHtml = node.children
-            .filter(c => (c.type === 'element' || c.type === 'pseudo') && c.matched)
+            .filter(c => c.type === 'element' && c.matched)
             .map(c => this.renderTreeFiltered(c, depth + 1))
             .join('');
 
@@ -5028,27 +4452,16 @@ class DomInspector {
     toSelector(node) {
         if (!node || node.type !== 'element') return '';
 
-        // 1. id unique
         if (node.id) {
-            const s = `#${CSS.escape(node.id)}`;
+            const s = `#${node.id}`;
             if (document.querySelectorAll(s).length === 1) return s;
         }
 
-        // 2. class unique
         if (node.classes.length > 0) {
             const s = `${node.tag}.${node.classes.join('.')}`;
             if (document.querySelectorAll(s).length === 1) return s;
         }
 
-        // 3. data attribute unique
-        const dataAttrs = Object.keys(node.attrs).filter(k => k.startsWith('data-'));
-        for (const key of dataAttrs) {
-            const val = node.attrs[key];
-            const s = `${node.tag}[${key}="${val}"]`;
-            if (document.querySelectorAll(s).length === 1) return s;
-        }
-
-        // 4/5. Build path with nth-of-type
         const path = [];
         let el = node.elementRef;
         while (el && el !== document.body && el !== document.documentElement) {
@@ -5057,7 +4470,7 @@ class DomInspector {
             const classes = Array.from(el.classList).filter(c => !c.startsWith('toki-') && !c.startsWith('sc-'));
 
             let seg = tag;
-            if (id) { path.unshift(`#${CSS.escape(id)}`); break; }
+            if (id) { path.unshift(`#${id}`); break; }
             if (classes.length > 0) seg += `.${classes.join('.')}`;
 
             const parent = el.parentElement;
@@ -5065,7 +4478,7 @@ class DomInspector {
                 const sameTag = Array.from(parent.children).filter(c => c.tagName === el.tagName);
                 if (sameTag.length > 1) {
                     const nth = sameTag.indexOf(el) + 1;
-                    seg += `:nth-of-type(${nth})`;
+                    seg += `:nth-child(${nth})`;
                 }
             }
 
@@ -5073,7 +4486,13 @@ class DomInspector {
             el = el.parentElement;
         }
 
-        return path.join(' > ');
+        let sel = path.join(' > ');
+        if (node.classes.length > 0) {
+            const s = `${node.tag}.${node.classes.join('.')}`;
+            if (document.querySelectorAll(s).length === 1) return s;
+        }
+
+        return sel;
     }
 
     /**
@@ -5086,51 +4505,32 @@ class DomInspector {
     }
 
     _render(container) {
+        this.nodeMap = [];
+        const treeHtml = this.renderTree(this.treeData);
+
         container.innerHTML = `
             <div class="di-panel">
                 <div class="di-toolbar">
-                    <div class="di-title">\u{1F9EC} DOM \uAC80\uC0AC\uAE30</div>
+                    <div class="di-title">🧬 DOM 검사기</div>
                     <div class="di-toolbar-right">
-                        <span class="di-count">0 elements</span>
-                        <button class="di-refresh" title="DOM \uC0C8\uB85C\uACE0\uCE68">\u21BB</button>
+                        <span class="di-count">${this.nodeMap.length} elements</span>
+                        <button class="di-refresh" title="DOM 새로고침">↻</button>
                     </div>
                 </div>
                 <div class="di-filter-bar">
-                    <input type="text" class="di-filter" placeholder="\u{1F50D} \uD0DC\uADF8 / \uD074\uB798\uC2A4 / \uD14D\uC2A4\uD2B8 \uAC80\uC0C9..." />
+                    <input type="text" class="di-filter" placeholder="🔍 태그 / 클래스 / 텍스트 검색..." />
                 </div>
                 <div class="di-tree-wrap">
-                    <div class="di-tree"></div>
+                    <div class="di-tree">${treeHtml}</div>
                 </div>
                 <div class="di-detail" id="di-detail">
-                    <div class="di-detail-header">\u{1F4CB} \uC694\uC18C \uC815\uBCF4</div>
+                    <div class="di-detail-header">📋 요소 정보</div>
                     <div class="di-detail-body" id="di-detail-body">
-                        <span class="di-detail-placeholder">\uD2B8\uB9AC\uC5D0\uC11C \uC694\uC18C\uB97C \uD074\uB9AD\uD558\uC138\uC694</span>
+                        <span class="di-detail-placeholder">트리에서 요소를 클릭하세요</span>
                     </div>
                 </div>
             </div>
         `;
-
-        const tree = container.querySelector('.di-tree');
-        this.renderTree(tree);
-
-        // Update count after render
-        const countEl = container.querySelector('.di-count');
-        if (countEl) {
-            const updateCount = () => { countEl.textContent = `${this.nodeMap.length} elements`; };
-            // For chunked rendering, poll until stable
-            if (this.nodeMap.length === 0) {
-                const poll = setInterval(() => {
-                    updateCount();
-                    if (this.nodeMap.length > 0 && tree.innerHTML.length > 0) {
-                        clearInterval(poll);
-                        updateCount();
-                    }
-                }, 50);
-                setTimeout(() => clearInterval(poll), 3000);
-            } else {
-                updateCount();
-            }
-        }
 
         this._bindEvents(container);
     }
@@ -5152,7 +4552,7 @@ class DomInspector {
             if (!children) return;
             const isOpen = !children.classList.contains('di-collapsed');
             children.classList.toggle('di-collapsed');
-            arrow.textContent = isOpen ? '\u25B6' : '\u25BC';
+            arrow.textContent = isOpen ? '▶' : '▼';
         });
 
         // Line click (not on arrow) → select element
@@ -5179,7 +4579,7 @@ class DomInspector {
             clearTimeout(filterTimer);
             filterTimer = setTimeout(() => {
                 this._applyFilter(filter.value, tree);
-            }, 150);
+            }, 200);
         };
 
         // Refresh
@@ -5207,7 +4607,6 @@ class DomInspector {
         const idStr = node.id ? `#${node.id}` : '-';
         const clsStr = node.classes.length > 0 ? node.classes.join(' ') : '-';
         const textStr = node.text ? node.text.substring(0, 100) : '-';
-        const hiddenStr = node.hidden ? node.hidden : '-';
         const selectorStr = selector;
 
         // Encode selector safely for the code element
@@ -5215,24 +4614,22 @@ class DomInspector {
 
         detailBody.innerHTML = `
             <div class="di-detail-grid">
-                <div class="di-detail-label">\uD0DC\uADF8</div>
+                <div class="di-detail-label">태그</div>
                 <div class="di-detail-val"><span class="di-tag">${tagStr}</span></div>
                 <div class="di-detail-label">ID</div>
                 <div class="di-detail-val"><span class="di-id">${idStr}</span></div>
-                <div class="di-detail-label">\uD074\uB798\uC2A4</div>
+                <div class="di-detail-label">클래스</div>
                 <div class="di-detail-val"><span class="di-class">${clsStr}</span></div>
-                <div class="di-detail-label">\uD14D\uC2A4\uD2B8</div>
+                <div class="di-detail-label">텍스트</div>
                 <div class="di-detail-val di-detail-text">${textStr}</div>
-                <div class="di-detail-label">\uC228\uAE68\uAE40</div>
-                <div class="di-detail-val"><span class="di-class">${hiddenStr}</span></div>
             </div>
             <div class="di-detail-selector">
-                <div class="di-detail-label">\uC0DD\uC131\uB41C \uC140\uB809\uD130</div>
+                <div class="di-detail-label">생성된 셀렉터</div>
                 <div class="di-selector-row">
                     <code class="di-selector-code">${encodedSelector}</code>
                     <div class="di-selector-actions">
-                        <button class="di-btn-copy">\u{1F4CB}</button>
-                        <button class="di-btn-apply" title="\uD604\uC7AC \uC785\uB825 \uD544\uB4DC\uC5D0 \uC140\uB809\uD130 \uC801\uC6A9">\u{1F4DD} \uC801\uC6A9</button>
+                        <button class="di-btn-copy">📋</button>
+                        <button class="di-btn-apply" title="현재 입력 필드에 셀렉터 적용">📝 적용</button>
                     </div>
                 </div>
             </div>
@@ -5243,8 +4640,8 @@ class DomInspector {
         if (copyBtn) {
             copyBtn.onclick = () => {
                 this._copyToClipboard(selectorStr);
-                copyBtn.textContent = '\u2705';
-                setTimeout(() => { copyBtn.textContent = '\u{1F4CB}'; }, 1500);
+                copyBtn.textContent = '✅';
+                setTimeout(() => { copyBtn.textContent = '📋'; }, 1500);
             };
         }
 
@@ -5254,8 +4651,8 @@ class DomInspector {
             applyBtn.onclick = () => {
                 if (this.onApply && selector) {
                     this.onApply(selector);
-                    applyBtn.textContent = '\u2705 \uC801\uC6A9\uB428';
-                    setTimeout(() => { applyBtn.textContent = '\u{1F4DD} \uC801\uC6A9'; }, 1500);
+                    applyBtn.textContent = '✅ 적용됨';
+                    setTimeout(() => { applyBtn.textContent = '📝 적용'; }, 1500);
                 }
             };
         }
@@ -5263,35 +4660,15 @@ class DomInspector {
 
     _applyFilter(text, tree) {
         this.filterText = text;
+        this.nodeMap = [];
 
         if (!text.trim()) {
             this.build();
-            this.renderTree(tree);
+            tree.innerHTML = this.renderTree(this.treeData);
             return;
         }
 
-        const keyword = text.toLowerCase();
-
-        // TreeWalker full-text search
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        let textNode;
-        while (textNode = walker.nextNode()) {
-            const content = textNode.textContent.toLowerCase();
-            if (content.includes(keyword)) {
-                let parent = textNode.parentElement;
-                while (parent && parent !== document.body) {
-                    const treeNode = this.elementToNode.get(parent);
-                    if (treeNode && !treeNode.matched) {
-                        treeNode.matched = true;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-        }
-
-        // Also filter by tag/class/attr
         this.filterNodes(this.treeData, text);
-
         tree.innerHTML = this.renderTreeFiltered(this.treeData);
     }
 
@@ -5328,7 +4705,7 @@ class DomInspector {
             document.execCommand('copy');
             document.body.removeChild(ta);
         } catch (e) {
-            console.warn('[DomInspector] \uD074\uB9BD\uBCF4\uB4DC \uBCF5\uC0AC \uC2E4\uD328:', e);
+            console.warn('[DomInspector] 클립보드 복사 실패:', e);
         }
     }
 
@@ -5341,7 +4718,6 @@ var SubscriptionManager = __webpack_require__(330);
  * FormRuleEditor Module for TokiSync
  * Specialist UI for managing parsing rules with a sleek Form-Tree Hybrid interface.
  */
-
 
 
 
@@ -5411,7 +4787,7 @@ class FormRuleEditor {
     }
 
     render() {
-        const scriptVer =  true ? "1.27.4" : 0;
+        const scriptVer =  true ? "1.26.4" : 0;
         this.overlay.innerHTML = `
             <div class="toki-modal toki-form-editor-modal">
                 <div class="toki-modal-header">
@@ -5646,7 +5022,7 @@ class FormRuleEditor {
                                 </div>
                             </div>
                             <div class="toki-form-grid">
-                                <div class="toki-form-row" style="grid-column: span 1">
+                                <div class="toki-form-row" style="grid-column: span 1;">
                                     <div class="toki-form-row-header">
                                         <span class="toki-form-row-label">제외 셀렉터 (exclude) (반점 구분)</span>
                                         <div class="toki-flex-row-8">
@@ -5667,18 +5043,18 @@ class FormRuleEditor {
                     <!-- Right Column: JSON Preview & Sandbox -->
                     <div class="toki-form-editor-right">
                         <div class="toki-flex-between">
-                            <span class="toki-form-row-label toki-font-extrabold">⚙️ 실시간 완성 JSON 규칙</span>
+                            <span class="toki-form-row-label" style="font-weight: 800;">⚙️ 실시간 완성 JSON 규칙</span>
                             <span id="form-json-status" class="toki-badge-match ok">✓ Valid</span>
                         </div>
-                        <textarea class="toki-tree-json-preview toki-flex-1 toki-text-11 toki-leading-14" id="form-json-editor" spellcheck="false"></textarea>
+                        <textarea class="toki-tree-json-preview toki-flex-1" id="form-json-editor" spellcheck="false" style="font-size: 11px; line-height:1.4;"></textarea>
                         
                         <div class="toki-form-card" style="margin: 0; padding: 12px; background: rgba(0,0,0,0.02);">
-                            <div class="toki-form-row-label toki-font-extrabold toki-text-primary">🧪 로컬 셀렉터 가상 테스트</div>
+                            <div class="toki-form-row-label" style="font-weight: 800; color: var(--toki-primary);">🧪 로컬 셀렉터 가상 테스트</div>
                             <div class="toki-flex-row-8">
                                 <input type="text" id="form-test-url" class="toki-input-compact toki-flex-1" style="height:32px; font-size:12px; padding: 4px 10px;" value="${window.location.href}">
                                 <button class="toki-btn-rule toki-text-success" id="form-btn-test" style="height:32px; padding:0 12px;">테스트</button>
                             </div>
-                            <div id="form-test-result" class="toki-text-xs toki-mt-4 toki-text-muted">
+                            <div id="form-test-result" class="toki-text-xs" style="margin-top: 4px; color: var(--toki-text-muted);">
                                 현재 페이지 또는 지정한 URL 주소의 DOM 파싱 검증을 원클릭으로 가상 작동해보세요.
                             </div>
                         </div>
@@ -6153,18 +5529,18 @@ class FormRuleEditor {
         if (!rightPanel) return;
         rightPanel.innerHTML = `
             <div class="toki-flex-between">
-                <span class="toki-form-row-label toki-font-extrabold">⚙️ 실시간 완성 JSON 규칙</span>
+                <span class="toki-form-row-label" style="font-weight: 800;">⚙️ 실시간 완성 JSON 규칙</span>
                 <span id="form-json-status" class="toki-badge-match ok">✓ Valid</span>
             </div>
-            <textarea class="toki-tree-json-preview toki-flex-1 toki-text-11 toki-leading-14" id="form-json-editor" spellcheck="false"></textarea>
+            <textarea class="toki-tree-json-preview toki-flex-1" id="form-json-editor" spellcheck="false" style="font-size: 11px; line-height:1.4;"></textarea>
             
             <div class="toki-form-card" style="margin: 0; padding: 12px; background: rgba(0,0,0,0.02);">
-                <div class="toki-form-row-label toki-font-extrabold toki-text-primary">🧪 로컬 셀렉터 가상 테스트</div>
+                <div class="toki-form-row-label" style="font-weight: 800; color: var(--toki-primary);">🧪 로컬 셀렉터 가상 테스트</div>
                 <div class="toki-flex-row-8">
                     <input type="text" id="form-test-url" class="toki-input-compact toki-flex-1" style="height:32px; font-size:12px; padding: 4px 10px;" value="${window.location.href}">
                     <button class="toki-btn-rule toki-text-success" id="form-btn-test" style="height:32px; padding:0 12px;">테스트</button>
                 </div>
-                <div id="form-test-result" class="toki-text-xs toki-mt-4 toki-text-muted">
+                <div id="form-test-result" class="toki-text-xs" style="margin-top: 4px; color: var(--toki-text-muted);">
                     현재 페이지 또는 지정한 URL 주소의 DOM 파싱 검증을 원클릭으로 가상 작동해보세요.
                 </div>
             </div>
@@ -6616,14 +5992,14 @@ class MenuModal {
                     </div>
                     
                     <div id="toki-inline-progress" style="display: none; padding: 12px; background: rgba(0,0,0,0.04); border-radius: 8px; margin-top: 12px; border: 1px solid rgba(0,0,0,0.06);">
-                        <div class="toki-font-semibold toki-mb-8 toki-text-13 toki-flex-between" id="toki-inline-header">
+                        <div style="font-weight: 600; margin-bottom: 8px; font-size: 13px; display: flex; justify-content: space-between;" id="toki-inline-header">
                             <span id="toki-inline-text">수집 준비 중...</span>
-                            <span id="toki-inline-percent" class="toki-text-primary">0%</span>
+                            <span id="toki-inline-percent" style="color: var(--toki-primary, #6366f1);">0%</span>
                         </div>
                         <div class="toki-progress-bar-container" style="background: rgba(0,0,0,0.08); border-radius: 4px; height: 8px; overflow: hidden; margin-bottom: 12px; position: relative;">
                             <div id="toki-inline-bar" class="toki-progress-overall-bar-fill" style="width: 0%; height: 100%; background: var(--toki-primary, #6366f1); transition: width 0.3s ease;"></div>
                         </div>
-                        <div class="toki-btn-group-row toki-gap-8">
+                        <div class="toki-btn-group-row" style="gap: 8px;">
                             <button class="toki-btn-action toki-btn-secondary toki-flex-1" id="toki-inline-pause" style="height: 36px; padding: 0;">
                                 <span>⏸️ 일시 정지</span>
                             </button>
@@ -6679,9 +6055,9 @@ class MenuModal {
 
                     <div class="toki-control-group">
                         <label class="toki-label">이미지 스캔 속도
-                            <span id="toki-scan-speed-val" class="toki-font-bold toki-text-primary">1000ms</span>
+                            <span id="toki-scan-speed-val" style="font-weight: bold; color: var(--toki-primary, #6366f1);">1000ms</span>
                         </label>
-                        <input type="range" id="toki-sel-scanspeed" min="100" max="5000" step="100" value="1000" class="toki-range toki-w-full">
+                        <input type="range" id="toki-sel-scanspeed" min="100" max="5000" step="100" value="1000" class="toki-range" style="width: 100%;">
                         <div class="toki-hint" style="font-size: 11px; color: #888; margin-top: 4px;">
                             100ms(빠름/불안정) ─ 1000ms(기본/권장) ─ 3000ms(안정) ─ 5000ms(확실)
                         </div>
@@ -6765,7 +6141,7 @@ class MenuModal {
                             <span>🔄 지금 즉시 동기화</span>
                         </button>
                     </div>
-                    <p class="toki-text-xs toki-text-center toki-leading-16">
+                    <p class="toki-text-xs toki-text-center toki-line-16">
                         구글 드라이브와의 연결을 확인하고 동기화 이력을 체크합니다.
                     </p>
                 </div>
@@ -6810,7 +6186,7 @@ class MenuModal {
                     <button class="toki-dashboard-modal-close" id="toki-btn-modal-progress-close" title="닫기">&times;</button>
                 </div>
                 <div class="toki-dashboard-modal-content">
-                    <div id="toki-logbox-progress" class="toki-visible-block">
+                    <div id="toki-logbox-progress" style="display: block;">
                         <div id="toki-progress-header">
                             <span id="toki-progress-overall-text">진행률: 0% (0 / 0)</span>
                             <div id="toki-progress-overall-controls">
@@ -6847,7 +6223,7 @@ class MenuModal {
                     <button class="toki-dashboard-modal-close" id="toki-btn-modal-logs-close" title="닫기">&times;</button>
                 </div>
                 <div class="toki-dashboard-modal-content">
-                    <div id="toki-dashboard-log-section" class="toki-visible-flex">
+                    <div id="toki-dashboard-log-section" style="display: flex;">
                         <div class="toki-log-tabs">
                             <button class="toki-log-tab-btn active" data-logtab="service">📋 서비스 로그</button>
                             <button class="toki-log-tab-btn" data-logtab="debug">🛠️ 디버그 콘솔</button>
@@ -7247,7 +6623,7 @@ class MenuModal {
 }
 
 ;// ./src/core/ui/ui.css
-var ui_namespaceObject = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');\n\n:root {\n    --toki-primary: #2563eb;\n    --toki-primary-dark: #1d4ed8;\n    --toki-accent: #facc15;\n    --toki-bg: rgba(248, 250, 252, 0.9);\n    --toki-text: #1e293b;\n    --toki-text-muted: #64748b;\n    --toki-border: rgba(255, 255, 255, 0.6);\n    --toki-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);\n    --toki-font: 'Inter', -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif;\n}\n\n/* ==========================================\n   Layer 1: Atomic Utility Classes\n   ========================================== */\n\n/* Layout */\n.toki-flex { display: flex; }\n.toki-flex-col { display: flex; flex-direction: column; }\n.toki-flex-wrap { flex-wrap: wrap; }\n.toki-flex-center { display: flex; align-items: center; }\n.toki-flex-col-center { display: flex; flex-direction: column; align-items: center; }\n.toki-inline-flex { display: inline-flex; }\n.toki-grid { display: grid; }\n\n/* Gap */\n.toki-gap-2 { gap: 2px; }\n.toki-gap-4 { gap: 4px; }\n.toki-gap-5 { gap: 5px; }\n.toki-gap-6 { gap: 6px; }\n.toki-gap-8 { gap: 8px; }\n.toki-gap-10 { gap: 10px; }\n.toki-gap-12 { gap: 12px; }\n.toki-gap-14 { gap: 14px; }\n.toki-gap-16 { gap: 16px; }\n.toki-gap-20 { gap: 20px; }\n\n/* Padding */\n.toki-p-0 { padding: 0; }\n.toki-p-2 { padding: 2px; }\n.toki-p-4 { padding: 4px; }\n.toki-p-6 { padding: 6px; }\n.toki-p-8 { padding: 8px; }\n.toki-p-10 { padding: 10px; }\n.toki-p-12 { padding: 12px; }\n.toki-p-14 { padding: 14px; }\n.toki-p-16 { padding: 16px; }\n.toki-p-18 { padding: 18px; }\n.toki-p-20 { padding: 20px; }\n.toki-p-24 { padding: 24px; }\n.toki-p-32 { padding: 32px; }\n.toki-px-4 { padding-left: 4px; padding-right: 4px; }\n.toki-px-6 { padding-left: 6px; padding-right: 6px; }\n.toki-px-8 { padding-left: 8px; padding-right: 8px; }\n.toki-px-10 { padding-left: 10px; padding-right: 10px; }\n.toki-px-12 { padding-left: 12px; padding-right: 12px; }\n.toki-px-14 { padding-left: 14px; padding-right: 14px; }\n.toki-px-16 { padding-left: 16px; padding-right: 16px; }\n.toki-px-20 { padding-left: 20px; padding-right: 20px; }\n.toki-px-24 { padding-left: 24px; padding-right: 24px; }\n.toki-px-32 { padding-left: 32px; padding-right: 32px; }\n.toki-py-2 { padding-top: 2px; padding-bottom: 2px; }\n.toki-py-4 { padding-top: 4px; padding-bottom: 4px; }\n.toki-py-6 { padding-top: 6px; padding-bottom: 6px; }\n.toki-py-8 { padding-top: 8px; padding-bottom: 8px; }\n.toki-py-10 { padding-top: 10px; padding-bottom: 10px; }\n.toki-py-12 { padding-top: 12px; padding-bottom: 12px; }\n.toki-py-14 { padding-top: 14px; padding-bottom: 14px; }\n\n/* Margin */\n.toki-m-0 { margin: 0; }\n.toki-mt-2 { margin-top: 2px; }\n.toki-mt-4 { margin-top: 4px; }\n.toki-mt-6 { margin-top: 6px; }\n.toki-mt-8 { margin-top: 8px; }\n.toki-mt-12 { margin-top: 12px; }\n.toki-mt-20 { margin-top: 20px; }\n.toki-mt-24 { margin-top: 24px; }\n.toki-mt-32 { margin-top: 32px; }\n.toki-mt-40 { margin-top: 40px; }\n.toki-mb-2 { margin-bottom: 2px; }\n.toki-mb-4 { margin-bottom: 4px; }\n.toki-mb-5 { margin-bottom: 5px; }\n.toki-mb-6 { margin-bottom: 6px; }\n.toki-mb-8 { margin-bottom: 8px; }\n.toki-mb-10 { margin-bottom: 10px; }\n.toki-mb-12 { margin-bottom: 12px; }\n.toki-mb-20 { margin-bottom: 20px; }\n.toki-mb-24 { margin-bottom: 24px; }\n.toki-ml-4 { margin-left: 4px; }\n.toki-ml-8 { margin-left: 8px; }\n.toki-ml-auto { margin-left: auto; }\n\n/* Typography */\n.toki-text-8 { font-size: 8px; }\n.toki-text-9 { font-size: 9px; }\n.toki-text-10 { font-size: 10px; }\n.toki-text-11 { font-size: 11px; }\n.toki-text-12 { font-size: 12px; }\n.toki-text-13 { font-size: 13px; }\n.toki-text-14 { font-size: 14px; }\n.toki-text-15 { font-size: 15px; }\n.toki-text-16 { font-size: 16px; }\n.toki-text-20 { font-size: 20px; }\n.toki-text-24 { font-size: 24px; }\n.toki-text-muted { color: var(--toki-text-muted); }\n.toki-text-primary { color: var(--toki-primary); }\n.toki-text-danger { color: #ff5555; }\n.toki-text-success { color: #4ade80; }\n.toki-font-medium { font-weight: 500; }\n.toki-font-semibold { font-weight: 600; }\n.toki-font-bold { font-weight: 700; }\n.toki-font-extrabold { font-weight: 800; }\n.toki-leading-1 { line-height: 1; }\n.toki-leading-14 { line-height: 1.4; }\n.toki-leading-15 { line-height: 1.5; }\n.toki-leading-16 { line-height: 1.6; }\n.toki-text-center { text-align: center; }\n\n/* Visual */\n.toki-rounded-3 { border-radius: 3px; }\n.toki-rounded-4 { border-radius: 4px; }\n.toki-rounded-5 { border-radius: 5px; }\n.toki-rounded-6 { border-radius: 6px; }\n.toki-rounded-8 { border-radius: 8px; }\n.toki-rounded-10 { border-radius: 10px; }\n.toki-rounded-12 { border-radius: 12px; }\n.toki-rounded-14 { border-radius: 14px; }\n.toki-rounded-16 { border-radius: 16px; }\n.toki-rounded-18 { border-radius: 18px; }\n.toki-rounded-20 { border-radius: 20px; }\n.toki-rounded-24 { border-radius: 24px; }\n.toki-rounded-28 { border-radius: 28px; }\n.toki-rounded-full { border-radius: 999px; }\n.toki-shadow-sm { box-shadow: 0 1px 3px rgba(0,0,0,0.1); }\n.toki-shadow { box-shadow: var(--toki-shadow); }\n.toki-surface { background: var(--toki-bg); }\n.toki-border-light { border: 1px solid var(--toki-border); }\n.toki-transition { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }\n.toki-w-full { width: 100%; }\n.toki-h-full { height: 100%; }\n.toki-cursor-pointer { cursor: pointer; }\n.toki-cursor-help { cursor: help; }\n.toki-relative { position: relative; }\n.toki-overflow-hidden { overflow: hidden; }\n\n/* Composite Utilities (convenience combos) */\n.toki-flex-1 { flex: 1; }\n.toki-flex-between { display: flex; justify-content: space-between; align-items: center; }\n.toki-flex-row { display: flex; gap: 4px; align-items: center; }\n.toki-flex-row-8 { display: flex; gap: 8px; align-items: center; }\n.toki-flex-row-10 { display: flex; gap: 10px; align-items: center; }\n.toki-visible-flex { display: flex !important; }\n.toki-visible-block { display: block !important; }\n.toki-hidden { display: none !important; }\n.toki-text-xs { font-size: 11px; color: #94a3b8; }\n.toki-text-sm { font-size: 12px; }\n.toki-text-lg { font-size: 20px; font-weight: 700; }\n.toki-divider { border: 0; border-top: 1px solid rgba(0,0,0,0.05); margin: 24px 0; }\n\n/* LogBox Styles */\n#toki-logbox {\n    position: fixed;\n    bottom: 100px;\n    right: 30px;\n    width: 480px;\n    height: auto;\n    min-height: 250px;\n    max-height: 500px;\n    background: var(--toki-bg);\n    color: var(--toki-text);\n    font-family: 'Cascadia Code', Consolas, monospace;\n    font-size: 12px;\n    border: 1px solid var(--toki-border);\n    border-radius: 16px;\n    z-index: 9999;\n    display: none;\n    flex-direction: column;\n    box-shadow: var(--toki-shadow);\n    backdrop-filter: blur(20px);\n    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);\n}\n\n#toki-logbox-header {\n    padding: 12px 16px;\n    background: rgba(255, 255, 255, 0.4);\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    border-top-left-radius: 16px;\n    border-top-right-radius: 16px;\n    cursor: move;\n}\n\n#toki-logbox-title {\n    font-weight: 700;\n    font-size: 13px;\n    letter-spacing: -0.01em;\n}\n\n#toki-logbox-controls span {\n    cursor: pointer;\n    margin-left: 12px;\n    color: var(--toki-text-muted);\n    font-size: 14px;\n    transition: transform 0.2s, color 0.2s;\n    display: inline-block;\n}\n\n#toki-logbox-controls span:hover {\n    color: var(--toki-primary);\n    transform: scale(1.15);\n}\n\n#toki-logbox-content {\n    flex: 1;\n    overflow-y: auto;\n    padding: 12px;\n    margin: 0;\n    list-style: none;\n}\n\n#toki-logbox-content li {\n    margin-bottom: 4px;\n    word-break: break-all;\n    padding: 4px 8px;\n    border-radius: 6px;\n    line-height: 1.4;\n    color: #f1f5f9; /* 밝은 회백색 지정으로 가독성 극대화 */\n}\n\n#toki-logbox-content li.critical {\n    color: #be123c;\n    font-weight: 700;\n    background: rgba(225, 29, 72, 0.1);\n    border-left: 3px solid #e11d48;\n}\n\n#toki-logbox-content li.error { color: #e11d48; }\n#toki-logbox-content li.warn { color: #d97706; }\n#toki-logbox-content li.success { color: #059669; font-weight: 600; }\n#toki-logbox-content li.info { color: #38bdf8; font-weight: 500; }\n\n/* Modal Styles */\n.toki-modal-overlay {\n    position: fixed;\n    top: 0;\n    left: 0;\n    width: 100%;\n    height: 100%;\n    background: rgba(15, 23, 42, 0.2);\n    backdrop-filter: blur(12px);\n    z-index: 9999;\n    display: flex;\n    justify-content: center;\n    align-items: center;\n    opacity: 0;\n    animation: tokiFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;\n}\n\n.toki-modal {\n    width: 520px;\n    max-width: 95%;\n    background: var(--toki-bg);\n    border: 1px solid var(--toki-border);\n    border-radius: 28px;\n    box-shadow: var(--toki-shadow);\n    overflow: hidden;\n    display: flex;\n    flex-direction: column;\n    transform: translateY(30px) scale(0.95);\n    animation: tokiSlideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;\n    backdrop-filter: blur(30px);\n    color: var(--toki-text);\n    font-family: var(--toki-font);\n}\n\n.toki-modal-header {\n    padding: 24px 32px;\n    background: rgba(255, 255, 255, 0.4);\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n}\n\n.toki-modal-title {\n    font-size: 24px;\n    font-weight: 800;\n    color: #0f172a;\n    display: flex;\n    align-items: center;\n    gap: 12px;\n    letter-spacing: -0.03em;\n}\n\n.toki-modal-close {\n    background: rgba(0, 0, 0, 0.05);\n    border: none;\n    color: var(--toki-text-muted);\n    width: 36px;\n    height: 36px;\n    border-radius: 50%;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);\n    font-size: 20px;\n}\n\n.toki-modal-close:hover {\n    background: #ef4444;\n    color: #fff;\n    transform: rotate(90deg);\n}\n\n.toki-btn-ghost {\n    background: rgba(0, 0, 0, 0.05);\n    border: none;\n    color: var(--toki-text-muted);\n    padding: 6px 14px;\n    border-radius: 12px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    font-size: 13px;\n    font-weight: 600;\n    gap: 6px;\n}\n\n.toki-btn-ghost:hover {\n    background: rgba(0, 0, 0, 0.08);\n    color: var(--toki-text);\n}\n\n/* Tabs */\n.toki-tabs {\n    display: flex;\n    background: rgba(255, 255, 255, 0.3);\n    padding: 8px;\n    gap: 6px;\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\n}\n\n.toki-tab-btn {\n    flex: 1;\n    padding: 12px;\n    background: none;\n    border: none;\n    color: var(--toki-text-muted);\n    font-size: 14px;\n    font-weight: 700;\n    cursor: pointer;\n    transition: all 0.3s;\n    border-radius: 14px;\n    display: flex;\n    justify-content: center;\n    align-items: center;\n    gap: 8px;\n}\n\n.toki-tab-btn:hover {\n    color: var(--toki-text);\n    background: rgba(255, 255, 255, 0.6);\n}\n\n.toki-tab-btn.active {\n    background: #fff;\n    color: var(--toki-primary);\n    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15);\n}\n\n.toki-tab-content {\n    display: none;\n    padding: 32px;\n    animation: tokiTabFadeIn 0.4s ease-out;\n}\n\n.toki-tab-content.active { display: block; }\n\n/* Components */\n.toki-section-title {\n    font-size: 11px;\n    font-weight: 800;\n    color: var(--toki-primary);\n    text-transform: uppercase;\n    letter-spacing: 0.1em;\n    margin: 24px 0 12px 4px;\n    opacity: 0.8;\n}\n\n.toki-control-group {\n    margin-bottom: 20px;\n    position: relative;\n}\n\n.toki-label {\n    display: block;\n    font-size: 13px;\n    font-weight: 700;\n    color: var(--toki-text-muted);\n    margin-bottom: 8px;\n    margin-left: 4px;\n}\n\n.toki-input, .toki-select, .toki-textarea {\n    box-sizing: border-box;\n    width: 100%;\n    padding: 14px 18px;\n    background: rgba(255, 255, 255, 0.8);\n    border: 1px solid rgba(0, 0, 0, 0.08);\n    border-radius: 16px;\n    color: var(--toki-text) !important;\n    font-size: 15px;\n    font-weight: 600;\n    appearance: none;\n    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);\n    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);\n}\n\n.toki-input:hover, .toki-select:hover, .toki-textarea:hover {\n    border-color: var(--toki-primary);\n    background-color: #fff;\n    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.08);\n}\n\n.toki-input:focus, .toki-select:focus, .toki-textarea:focus {\n    outline: none;\n    border-color: var(--toki-primary);\n    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1);\n    background-color: #fff;\n}\n\n.toki-textarea {\n    resize: vertical;\n    line-height: 1.5;\n}\n\n.toki-select {\n    cursor: pointer;\n    background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2364748b'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E\");\n    background-repeat: no-repeat;\n    background-position: right 16px center;\n    background-size: 16px;\n}\n\n.toki-btn-action {\n    width: 100%;\n    height: 56px;\n    background: var(--toki-primary);\n    color: #fff !important;\n    border: none;\n    border-radius: 18px;\n    font-size: 16px;\n    font-weight: 700;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    gap: 12px;\n    transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);\n    box-shadow: 0 8px 15px rgba(37, 99, 235, 0.2);\n}\n\n.toki-btn-action:hover {\n    transform: translateY(-3px);\n    box-shadow: 0 12px 20px rgba(37, 99, 235, 0.35);\n    filter: brightness(1.05);\n}\n\n.toki-btn-secondary {\n    background: rgba(255, 255, 255, 0.8);\n    color: #475569 !important;\n    border: 1px solid rgba(0, 0, 0, 0.05);\n    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);\n}\n\n.toki-btn-secondary:hover {\n    background: #fff;\n    color: var(--toki-text) !important;\n}\n\n.toki-btn-danger {\n    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;\n    color: #ffffff !important;\n    border: none !important;\n    box-shadow: 0 4px 10px rgba(239, 68, 68, 0.2) !important;\n}\n\n.toki-btn-danger:hover {\n    background: linear-gradient(135deg, #f87171 0%, #ef4444 100%) !important;\n    box-shadow: 0 6px 15px rgba(239, 68, 68, 0.35) !important;\n}\n\n/* Status & Indicators */\n.toki-status-dot {\n    width: 8px;\n    height: 8px;\n    border-radius: 50%;\n    display: inline-block;\n    margin-right: 6px;\n}\n\n.toki-status-online {\n    background: #10b981;\n    box-shadow: 0 0 8px #10b981;\n}\n\n.toki-downloaded {\n    background: rgba(16, 185, 129, 0.08) !important;\n    border-left: 4px solid #10b981 !important;\n    opacity: 0.75;\n    transition: all 0.3s ease;\n}\n\n.toki-downloaded:hover {\n    opacity: 1;\n    background: rgba(16, 185, 129, 0.15) !important;\n}\n\n/* FAB */\n.toki-fab {\n    position: fixed;\n    bottom: 30px;\n    right: 30px;\n    width: 64px;\n    height: 64px;\n    background: linear-gradient(135deg, #2563eb, #0ea5e9);\n    border-radius: 20px;\n    box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.4);\n    display: flex;\n    justify-content: center;\n    align-items: center;\n    cursor: pointer;\n    transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);\n    z-index: 9998;\n}\n\n.toki-fab:hover {\n    transform: translateY(-5px) rotate(5deg);\n    box-shadow: 0 20px 25px -5px rgba(37, 99, 235, 0.5);\n}\n\n.toki-fab svg {\n    width: 28px;\n    height: 28px;\n    fill: #fff;\n}\n\n\n\n.toki-btn-rule {\n    background: transparent;\n    border: 1px solid #ddd;\n    padding: 6px 12px;\n    border-radius: 8px;\n    font-size: 12px;\n    cursor: pointer;\n    transition: all 0.2s;\n}\n\n.toki-btn-rule:hover {\n    background: #f8fafc;\n    border-color: #94a3b8;\n}\n\n/* Animations */\n@keyframes tokiFadeIn {\n    from { opacity: 0; }\n    to { opacity: 1; }\n}\n\n@keyframes tokiTabFadeIn {\n    from { opacity: 0; transform: translateX(10px); }\n    to { opacity: 1; transform: translateX(0); }\n}\n\n@keyframes tokiSlideUp {\n    from { opacity: 0; transform: translateY(30px) scale(0.95); }\n    to { opacity: 1; transform: translateY(0) scale(1); }\n}\n\n/* --- Structural Layouts for Inline Replacement --- */\n\n/* Horizontal Button Row (e.g., Download buttons) */\n.toki-btn-group-row {\n    display: flex;\n    gap: 12px;\n    align-items: center;\n}\n.toki-btn-group-row .toki-btn-action {\n    height: 52px;\n    flex: 1;\n}\n.toki-btn-group-row .toki-flex-1-4 {\n    flex: 1.4;\n}\n\n/* Vertical Button Stack (e.g., Tool buttons) */\n.toki-btn-group-stack {\n    display: flex;\n    flex-direction: column;\n    gap: 8px;\n}\n.toki-btn-group-stack .toki-btn-action {\n    height: 44px;\n    justify-content: flex-start;\n    padding-left: 20px;\n}\n\n/* 1-Column Form Grid */\n.toki-form-grid {\n    display: grid;\n    grid-template-columns: 1fr;\n    gap: 14px;\n}\n\n/* Composite & Borderline Utilities */\n.toki-modal-main { padding: 32px; width: 520px; max-height: 85vh; overflow-y: auto; }\n.toki-btn-gradient-green { \n    background: linear-gradient(135deg, #10b981, #059669); \n    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);\n}\n\n.toki-btn-lavender { background: #6a5acd; font-weight: bold; }\n.toki-btn-slate { background: rgba(0,0,0,0.02); border-style: dashed; border-radius: 20px; }\n\n/* Helper Boxes */\n.toki-helper-box-blue {\n    margin: -10px 0 20px 0; padding: 14px; \n    background: rgba(37, 99, 235, 0.05); border: 1px solid rgba(37, 99, 235, 0.1); \n    border-radius: 18px;\n}\n\n/* Captcha Overlay */\n.toki-captcha-overlay {\n    position: fixed; top: 0; left: 0; width: 100%; height: 100%;\n    background: rgba(0,0,0,0.8); z-index: 10001;\n    display: flex; flex-direction: column; align-items: center; justify-content: center;\n    color: white; font-family: var(--toki-font);\n}\n.toki-captcha-frame {\n    width: 80%; height: 60%; background: white; \n    border-radius: 20px; overflow: hidden; \n    margin-bottom: 20px; box-shadow: 0 20px 50px rgba(0,0,0,0.5);\n}\n\n/* Component: Helper Description Text */\n.toki-helper-desc { line-height: 1.5; font-weight: 500; }\n\n/* Component: Small Button (e.g., Test Native) */\n.toki-btn-sm { height: 36px; font-size: 12px; border-radius: 12px; }\n\n/* Component: Sync Button (height 48px) */\n.toki-btn-sync { height: 48px; }\n\n/* Component: Modal Header without border */\n.toki-modal-header-borderless { border: none; }\n\n/* Component: Code Textarea */\n.toki-textarea-code { min-height: 120px; font-family: monospace; }\n\n/* Status Badges & Indicators */\n.toki-badge {\n    margin-left: 5px;\n    font-size: 12px;\n    vertical-align: middle;\n}\n\n.toki-downloaded {\n    opacity: 0.6;\n    background-color: rgba(74, 222, 128, 0.05) !important;\n    transition: opacity 0.3s ease;\n}\n.toki-downloaded:hover {\n    opacity: 1;\n}\n\n/* Iframe Elements */\n.toki-downloader-iframe {\n    width: 100%;\n    height: 600px;\n    opacity: 0.1;\n    pointer-events: none;\n    border: none;\n    margin-top: 40px;\n}\n\n.toki-captcha-iframe {\n    width: 100%;\n    height: 100%;\n    border: none;\n}\n\n/* Info Card & History Styles */\n.toki-info-card {\n    background: rgba(255, 255, 255, 0.4);\n    border: 1px solid rgba(0, 0, 0, 0.05);\n    border-radius: 12px;\n    padding: 12px 16px;\n    margin-bottom: 20px;\n}\n\n.toki-info-row {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    padding: 6px 0;\n}\n\n.toki-info-row:not(:last-child) {\n    border-bottom: 1px dashed rgba(0, 0, 0, 0.05);\n}\n\n.toki-info-label {\n    font-size: 13px;\n    color: var(--toki-text-muted);\n    font-weight: 500;\n}\n\n.toki-info-val {\n    font-size: 13px;\n    color: var(--toki-text);\n    font-weight: 700;\n    display: flex;\n    align-items: center;\n    gap: 6px;\n}\n\n/* --- Multi-Queue Progress Monitor Panel (v1.21.0) --- */\n#toki-logbox-progress {\n    padding: 14px 18px;\n    background: rgba(255, 255, 255, 0.25);\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\n    backdrop-filter: blur(10px);\n    display: flex;\n    flex-direction: column;\n    gap: 8px;\n}\n\n#toki-progress-header {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n}\n\n#toki-progress-overall-text {\n    font-size: 12px;\n    font-weight: 800;\n    color: var(--toki-primary);\n    letter-spacing: -0.02em;\n    background: linear-gradient(135deg, #4f46e5, #06b6d4);\n    -webkit-background-clip: text;\n    -webkit-text-fill-color: transparent;\n}\n\n}\n\n#toki-progress-overall-controls {\n    display: flex;\n    gap: 8px;\n    align-items: center;\n}\n\n.toki-progress-btn {\n    font-size: 13px;\n    cursor: pointer;\n    transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275), filter 0.2s ease, opacity 0.2s ease;\n    user-select: none;\n    opacity: 0.85;\n}\n\n.toki-progress-btn:hover {\n    transform: scale(1.25);\n    opacity: 1;\n    filter: drop-shadow(0 0 5px rgba(255, 255, 255, 0.6));\n}\n\n#toki-btn-queue-stop:hover {\n    filter: drop-shadow(0 0 6px #ef4444);\n}\n\n.toki-progress-bar-paused {\n    background: linear-gradient(90deg, #9ca3af 0%, #6b7280 50%, #4b5563 100%) !important;\n    box-shadow: 0 1px 3px rgba(107, 114, 128, 0.4) !important;\n    animation: tokiPulsePaused 2s infinite ease-in-out;\n}\n\n@keyframes tokiPulsePaused {\n    0%, 100% { opacity: 1; }\n    50% { opacity: 0.65; }\n}\n\n.toki-empty-queue-msg {\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n    justify-content: center;\n    padding: 24px 16px;\n    background: rgba(255, 255, 255, 0.04);\n    border: 1px dashed rgba(0, 0, 0, 0.08);\n    border-radius: 12px;\n    text-align: center;\n    gap: 6px;\n    margin: 8px 0;\n    backdrop-filter: blur(5px);\n}\n\n.toki-empty-queue-msg span {\n    font-size: 13px;\n    font-weight: 700;\n    color: var(--toki-primary, #6366f1);\n    opacity: 0.85;\n}\n\n.toki-empty-queue-msg p {\n    font-size: 11px;\n    color: #4b5563;\n    opacity: 0.75;\n    margin: 0;\n    line-height: 1.4;\n}\n\n.toki-progress-bar-container {\n    width: 100%;\n    height: 8px;\n    background: rgba(0, 0, 0, 0.06);\n    border-radius: 999px;\n    overflow: hidden;\n    position: relative;\n    border: 1px solid rgba(255, 255, 255, 0.5);\n    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);\n}\n\n.toki-progress-bar-fill {\n    height: 100%;\n    width: 0%;\n    background: linear-gradient(90deg, #6366f1 0%, #3b82f6 50%, #06b6d4 100%);\n    border-radius: 999px;\n    transition: width 0.4s cubic-bezier(0.16, 1, 0.3, 1);\n    box-shadow: 0 1px 3px rgba(99, 102, 241, 0.4);\n}\n\n#toki-progress-workers-list {\n    display: flex;\n    flex-direction: column;\n    gap: 8px;\n    margin-top: 6px;\n    max-height: 160px;\n    overflow-y: auto;\n    padding-right: 4px;\n}\n\n/* Custom Scrollbar for Workers List */\n#toki-progress-workers-list::-webkit-scrollbar {\n    width: 4px;\n}\n#toki-progress-workers-list::-webkit-scrollbar-track {\n    background: transparent;\n}\n#toki-progress-workers-list::-webkit-scrollbar-thumb {\n    background: rgba(0, 0, 0, 0.1);\n    border-radius: 999px;\n}\n\n.toki-worker-progress-item {\n    background: rgba(255, 255, 255, 0.35);\n    border: 1px solid rgba(255, 255, 255, 0.5);\n    border-radius: 10px;\n    padding: 8px 12px;\n    display: flex;\n    flex-direction: column;\n    gap: 6px;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);\n    transition: all 0.2s ease;\n}\n\n.toki-worker-progress-item:hover {\n    background: rgba(255, 255, 255, 0.55);\n    border-color: rgba(37, 99, 235, 0.15);\n    transform: translateY(-1px);\n    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.04);\n}\n\n.toki-worker-stage {\n    font-size: 11px;\n    font-weight: 700;\n    color: var(--toki-text-muted);\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n}\n\n.toki-worker-bar-container {\n    width: 100%;\n    height: 5px;\n    background: rgba(0, 0, 0, 0.04);\n    border-radius: 999px;\n    overflow: hidden;\n}\n\n.toki-worker-bar-fill {\n    height: 100%;\n    background: linear-gradient(90deg, #10b981 0%, #34d399 100%);\n    border-radius: 999px;\n    transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);\n}\n\n/* --- 📋 Realtime Queue List & Badges (v1.21.0) --- */\n#toki-progress-queue-section {\n    margin-top: 10px;\n    border-top: 1px solid rgba(0, 0, 0, 0.06);\n    padding-top: 8px;\n    display: flex;\n    flex-direction: column;\n    gap: 6px;\n}\n\n#toki-queue-section-header {\n    font-size: 11px;\n    font-weight: 700;\n    color: var(--toki-text-muted);\n    opacity: 0.85;\n}\n\n#toki-progress-queue-list {\n    display: flex;\n    flex-direction: column;\n    gap: 4px;\n    max-height: 120px;\n    overflow-y: auto;\n    padding-right: 2px;\n}\n\n#toki-progress-queue-list::-webkit-scrollbar {\n    width: 4px;\n}\n#toki-progress-queue-list::-webkit-scrollbar-track {\n    background: transparent;\n}\n#toki-progress-queue-list::-webkit-scrollbar-thumb {\n    background: rgba(0, 0, 0, 0.08);\n    border-radius: 999px;\n}\n\n.toki-queue-list-item {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    padding: 5px 8px;\n    background: rgba(255, 255, 255, 0.25);\n    border: 1px solid rgba(255, 255, 255, 0.4);\n    border-radius: 6px;\n    font-size: 11px;\n    transition: all 0.2s ease;\n}\n\n.toki-queue-list-item:hover {\n    background: rgba(255, 255, 255, 0.45);\n    transform: translateX(1px);\n}\n\n.toki-queue-item-meta {\n    display: flex;\n    align-items: center;\n    gap: 8px;\n    flex: 1;\n    min-width: 0;\n}\n\n.toki-queue-item-title {\n    color: var(--toki-text);\n    font-weight: 500;\n    white-space: nowrap;\n    overflow: hidden;\n    text-overflow: ellipsis;\n}\n\n.toki-queue-item-delete {\n    font-size: 10px;\n    cursor: pointer;\n    opacity: 0.6;\n    transition: all 0.15s ease;\n    padding: 2px;\n}\n\n.toki-queue-item-delete:hover {\n    opacity: 1;\n    transform: scale(1.2);\n}\n\n/* 세련된 HSL 상태 배지 */\n.toki-badge {\n    padding: 2px 6px;\n    border-radius: 4px;\n    font-size: 9px;\n    font-weight: 700;\n    white-space: nowrap;\n    text-transform: uppercase;\n}\n\n/* 대기 (🟡 HSL Tailored Yellow) */\n.toki-badge-pending {\n    background: hsl(45, 93%, 94%);\n    color: hsl(45, 90%, 35%);\n    border: 1px solid hsl(45, 93%, 85%);\n}\n\n/* 진행 (🟢 HSL Tailored Emerald) */\n.toki-badge-processing {\n    background: hsl(150, 84%, 93%);\n    color: hsl(150, 84%, 25%);\n    border: 1px solid hsl(150, 84%, 82%);\n}\n\n/* 완료 (🔵 HSL Tailored Sapphire) */\n.toki-badge-completed {\n    background: hsl(220, 95%, 94%);\n    color: hsl(220, 90%, 40%);\n    border: 1px solid hsl(220, 95%, 86%);\n}\n\n/* 실패 (🔴 HSL Tailored Ruby) */\n.toki-badge-failed {\n    background: hsl(0, 93%, 94%);\n    color: hsl(0, 90%, 45%);\n    border: 1px solid hsl(0, 93%, 86%);\n}\n\n/* --- FormRuleEditor: Hybrid Two-Track Parser GUI (v1.21.0) --- */\n.toki-form-editor-modal {\n    width: min(95vw, 1200px) !important;\n    max-height: min(85vh, 700px) !important;\n    border-radius: 24px !important;\n}\n\n.toki-form-editor-container {\n    display: flex !important;\n    flex-direction: row !important;\n    flex-wrap: nowrap !important;\n    flex: 1;\n    overflow: auto !important;\n    gap: 20px;\n    padding: 20px;\n    background: rgba(255, 255, 255, 0.15);\n}\n\n.toki-form-editor-left {\n    flex: 1.2 !important;\n    min-width: 550px !important;\n    overflow-y: auto;\n    display: flex;\n    flex-direction: column;\n    gap: 16px;\n    padding-right: 8px;\n}\n\n.toki-form-editor-left::-webkit-scrollbar {\n    width: 6px;\n}\n.toki-form-editor-left::-webkit-scrollbar-track {\n    background: transparent;\n}\n.toki-form-editor-left::-webkit-scrollbar-thumb {\n    background: rgba(0, 0, 0, 0.08);\n    border-radius: 999px;\n}\n\n.toki-form-editor-right {\n    flex: 1 !important;\n    min-width: 450px !important;\n    display: flex;\n    flex-direction: column;\n    gap: 16px;\n    background: rgba(255, 255, 255, 0.4);\n    padding: 20px;\n    border-radius: 18px;\n    border: 1px solid rgba(255, 255, 255, 0.5);\n    overflow: hidden;\n}\n\n.toki-form-card {\n    background: rgba(255, 255, 255, 0.45);\n    border: 1px solid rgba(0, 0, 0, 0.04);\n    border-radius: 16px;\n    padding: 16px 20px;\n    display: flex;\n    flex-direction: column;\n    gap: 12px;\n    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.01);\n    transition: all 0.2s ease;\n}\n\n.toki-form-card:hover {\n    background: rgba(255, 255, 255, 0.65);\n    border-color: rgba(37, 99, 235, 0.1);\n    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.02);\n}\n\n.toki-form-card-title {\n    font-size: 13px;\n    font-weight: 800;\n    color: var(--toki-primary);\n    text-transform: uppercase;\n    letter-spacing: 0.02em;\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    border-bottom: 1px solid rgba(0, 0, 0, 0.03);\n    padding-bottom: 8px;\n}\n\n.toki-form-row {\n    display: flex;\n    flex-direction: column;\n    gap: 6px;\n}\n\n.toki-form-row-header {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n}\n\n.toki-form-row-label {\n    font-size: 12px;\n    font-weight: 700;\n    color: var(--toki-text-muted);\n}\n\n.toki-input-compact {\n    width: 100%;\n    box-sizing: border-box;\n    min-width: 0;\n    padding: 10px 14px;\n    background: rgba(255, 255, 255, 0.7);\n    border: 1px solid rgba(0, 0, 0, 0.06);\n    border-radius: 10px;\n    font-size: 13px;\n    font-family: inherit;\n    transition: all 0.2s ease;\n}\n\n.toki-input-compact:focus {\n    outline: none;\n    border-color: var(--toki-primary);\n    background: #fff;\n    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);\n}\n\n.toki-badge-match {\n    font-size: 10px;\n    font-weight: 800;\n    padding: 2px 6px;\n    border-radius: 6px;\n    transition: all 0.2s ease;\n}\n\n.toki-badge-match.ok {\n    background: rgba(16, 185, 129, 0.1);\n    color: #10b981;\n}\n\n.toki-badge-match.zero {\n    background: rgba(245, 158, 11, 0.1);\n    color: #f59e0b;\n}\n\n.toki-badge-match.error {\n    background: rgba(239, 68, 68, 0.1);\n    color: #ef4444;\n}\n\n.toki-form-dropper-btn {\n    cursor: pointer;\n    font-size: 14px;\n    transition: transform 0.2s;\n    user-select: none;\n}\n.toki-form-dropper-btn:hover {\n    transform: scale(1.2);\n}\n\n.toki-form-verify-btn {\n    cursor: pointer;\n    font-size: 14px;\n    transition: transform 0.2s;\n    user-select: none;\n}\n.toki-form-verify-btn:hover {\n    transform: scale(1.2);\n}\n\n.toki-form-verify-result {\n    font-size: 11px;\n    font-weight: 600;\n    margin-top: 4px;\n    padding: 6px 10px;\n    border-radius: 8px;\n    line-height: 1.4;\n    word-break: break-all;\n}\n.toki-form-verify-result.success {\n    background: rgba(16, 185, 129, 0.08);\n    color: #10b981;\n    border: 1px solid rgba(16, 185, 129, 0.15);\n}\n.toki-form-verify-result.error {\n    background: rgba(239, 68, 68, 0.08);\n    color: #ef4444;\n    border: 1px solid rgba(239, 68, 68, 0.15);\n}\n\n/* --- 📱 Compact Responsive LogBox for Popups & Small Screens (v1.21.0 추가) --- */\n@media (max-width: 500px) {\n    #toki-logbox {\n        width: 100% !important;\n        height: 100% !important;\n        max-height: 100% !important;\n        bottom: 0 !important;\n        right: 0 !important;\n        left: 0 !important;\n        top: 0 !important;\n        border-radius: 0 !important;\n        border: none !important;\n        box-shadow: none !important;\n    }\n    /* 팝업에서는 전체 화면을 채우므로 드래그 헤더 무효화 및 모바일 친화형 축소 */\n    #toki-logbox-header {\n        cursor: default !important;\n        padding: 8px 12px !important;\n        border-top-left-radius: 0 !important;\n        border-top-right-radius: 0 !important;\n    }\n    #toki-logbox-content {\n        padding: 8px !important;\n        display: block !important; /* 팝업 상세로그 강제 개방 */\n        height: calc(100% - 35px) !important; /* 헤더를 제외한 영역 100% 점유 */\n        max-height: calc(100% - 35px) !important;\n    }\n    /* 팝업 내 불필요한 컨트롤 및 큐 진행률 카드 영역 강제 은닉 (사용자 피드백 반영) */\n    #toki-btn-audio, #toki-btn-report, #toki-logbox-progress {\n        display: none !important;\n    }\n}\n\n\n\n\n/* --- Dashboard Popup Specific Layout --- */\n#toki-dashboard-popup {\n    display: flex;\n    flex-direction: column;\n    width: 100vw;\n    height: 100vh;\n    margin: 0;\n    background: var(--toki-bg);\n    border: none;\n    border-radius: 0;\n    box-shadow: none;\n    overflow: hidden;\n}\n\n#toki-dashboard-header {\n    padding: 24px 32px;\n    background: rgba(255, 255, 255, 0.4);\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n}\n\n#toki-dashboard-title {\n    font-size: 24px;\n    font-weight: 800;\n    color: #0f172a;\n    display: flex;\n    align-items: center;\n    gap: 12px;\n    letter-spacing: -0.03em;\n}\n\n#toki-dashboard-header-controls {\n    display: flex;\n    gap: 12px;\n    align-items: center;\n}\n\n#toki-dashboard-log-section {\n    padding: 16px 20px;\n    background: rgba(0, 0, 0, 0.05);\n    border-radius: 12px;\n    margin: 0 20px 20px 20px;\n    display: flex;\n    flex-direction: column;\n    height: 250px; /* 실시간 로그창 영역 높이 명시 */\n    overflow: hidden;\n}\n\n#toki-dashboard-log-section #toki-logbox-content {\n    flex: 1;\n    overflow-y: auto; /* 내부 스크롤 강제 */\n    padding: 12px;\n    margin: 0;\n    list-style: none;\n    background: rgba(0, 0, 0, 0.2); /* 로그 시인성 제고를 위한 세련된 다크 패널 */\n    border-radius: 8px;\n    border: 1px solid rgba(255, 255, 255, 0.03);\n}\n\n#toki-log-header {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    font-weight: 700;\n    margin-bottom: 12px;\n    color: var(--toki-text-muted);\n}\n\n/* --- 대시보드 커스텀 모달 레이아웃 (v1.21.6 추가) --- */\n.toki-dashboard-modal-overlay {\n    position: fixed;\n    top: 0;\n    left: 0;\n    width: 100vw;\n    height: 100vh;\n    background: rgba(15, 23, 42, 0.75);\n    backdrop-filter: blur(8px);\n    z-index: 10005;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    animation: tokiFadeIn 0.25s ease-out;\n}\n\n.toki-dashboard-modal {\n    width: 90%;\n    max-width: 680px;\n    background: var(--toki-bg, #1a1a2e);\n    border: 1px solid rgba(255, 255, 255, 0.08);\n    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);\n    border-radius: 24px;\n    display: flex;\n    flex-direction: column;\n    overflow: hidden;\n    animation: tokiSlideUp 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);\n    color: #e0e0e0;\n}\n\n.toki-dashboard-modal-header {\n    padding: 18px 24px;\n    border-bottom: 1px solid rgba(255, 255, 255, 0.05);\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    background: rgba(255, 255, 255, 0.02);\n}\n\n.toki-dashboard-modal-title {\n    font-size: 15px;\n    font-weight: 800;\n    color: var(--toki-primary, #6366f1);\n}\n\n.toki-dashboard-modal-close {\n    background: transparent;\n    border: none;\n    font-size: 24px;\n    font-weight: 700;\n    color: #94a3b8;\n    cursor: pointer;\n    line-height: 1;\n    transition: all 0.2s ease;\n}\n\n.toki-dashboard-modal-close:hover {\n    color: #ef4444;\n    transform: scale(1.1);\n}\n\n.toki-dashboard-modal-content {\n    padding: 20px;\n    overflow-y: auto;\n    max-height: 75vh;\n}\n\n/* 진행상황 모달 내 레이아웃 오버라이드 */\n#toki-modal-progress #toki-logbox-progress {\n    background: transparent !important;\n    border: none !important;\n    padding: 0 !important;\n    backdrop-filter: none !important;\n}\n#toki-modal-progress #toki-progress-queue-list {\n    max-height: 220px;\n}\n\n/* 로그 모달 내 레이아웃 오버라이드 */\n#toki-modal-logs #toki-dashboard-log-section {\n    margin: 0 !important;\n    padding: 0 !important;\n    background: transparent !important;\n    height: 400px !important;\n}\n#toki-modal-logs .toki-log-panel {\n    height: 330px !important;\n    max-height: 330px !important;\n    overflow-y: auto;\n}\n\n/* 대기열 모달 최대화 시의 너비 및 리스트 세로 높이 확장 */\n.toki-dashboard-modal-overlay.toki-queue-maximized .toki-dashboard-modal {\n    max-width: 850px !important;\n}\n.toki-dashboard-modal-overlay.toki-queue-maximized #toki-progress-queue-list {\n    max-height: 480px !important;\n    height: 480px !important;\n}\n\n/* 탭 본문 영역 세로 스크롤 활성화 (v1.21.8) */\n.toki-modal-body {\n    flex: 1;\n    overflow-y: auto !important;\n    max-height: calc(100vh - 120px);\n    padding-bottom: 40px;\n}\n\n/* Custom Scrollbar for Modal Body */\n.toki-modal-body::-webkit-scrollbar {\n    width: 6px;\n}\n.toki-modal-body::-webkit-scrollbar-track {\n    background: transparent;\n}\n.toki-modal-body::-webkit-scrollbar-thumb {\n    background: rgba(0, 0, 0, 0.12);\n    border-radius: 999px;\n}\n.toki-modal-body::-webkit-scrollbar-thumb:hover {\n    background: rgba(0, 0, 0, 0.25);\n}\n\n/* --- 🧬 DOM Inspector Panel (v2 — DevTools Style) --- */\n.toki-inspector-mount {\n    flex: 1;\n    display: flex;\n    flex-direction: column;\n    overflow: hidden;\n    min-height: 0;\n    border-radius: 12px;\n}\n\n.di-panel {\n    flex: 1;\n    display: flex;\n    flex-direction: column;\n    background: #1e1e2e;\n    overflow: hidden;\n    font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;\n    font-size: 12px;\n    line-height: 1.6;\n    color: #cdd6f4;\n}\n\n/* ── Toolbar ── */\n.di-toolbar {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    padding: 7px 14px;\n    background: #181825;\n    border-bottom: 1px solid #313244;\n    flex-shrink: 0;\n}\n\n.di-title {\n    font-weight: 700;\n    font-size: 12px;\n    color: #cba6f7;\n    letter-spacing: -0.01em;\n}\n\n.di-toolbar-right {\n    display: flex;\n    align-items: center;\n    gap: 10px;\n}\n\n.di-count {\n    font-size: 10px;\n    color: #585b70;\n}\n\n.di-refresh {\n    background: #313244;\n    border: none;\n    border-radius: 5px;\n    color: #6c7086;\n    cursor: pointer;\n    padding: 1px 7px;\n    font-size: 14px;\n    line-height: 1.5;\n    transition: all 0.15s;\n}\n\n.di-refresh:hover {\n    background: #45475a;\n    color: #cdd6f4;\n}\n\n/* ── Filter ── */\n.di-filter-bar {\n    padding: 5px 14px;\n    background: #181825;\n    border-bottom: 1px solid #313244;\n    flex-shrink: 0;\n}\n\n.di-filter {\n    width: 100%;\n    box-sizing: border-box;\n    background: #313244;\n    border: 1px solid #45475a;\n    border-radius: 5px;\n    padding: 4px 9px;\n    font-size: 11px;\n    color: #cdd6f4;\n    font-family: inherit;\n    outline: none;\n}\n\n.di-filter::placeholder { color: #585b70; }\n.di-filter:focus { border-color: #cba6f7; }\n\n/* ── Tree area ── */\n.di-tree-wrap {\n    flex: 1;\n    overflow-y: auto;\n    overflow-x: auto;\n    min-height: 0;\n    background: #1e1e2e;\n}\n\n.di-tree-wrap::-webkit-scrollbar { width: 4px; height: 4px; }\n.di-tree-wrap::-webkit-scrollbar-track { background: transparent; }\n.di-tree-wrap::-webkit-scrollbar-thumb { background: #45475a; border-radius: 999px; }\n\n.di-tree {\n    padding: 2px 0;\n}\n\n/* ── Tree lines ── */\n.di-line {\n    padding: 0 14px 0 0;\n    cursor: pointer;\n    white-space: nowrap;\n    font-size: 11px;\n    line-height: 22px;\n    user-select: none;\n    border-left: 2px solid transparent;\n}\n\n.di-line:hover {\n    background: rgba(203, 166, 247, 0.06);\n}\n\n.di-line.di-selected {\n    background: rgba(203, 166, 247, 0.12);\n    border-left-color: #cba6f7;\n}\n\n.di-line.di-dimmed { opacity: 0.35; }\n\n.di-arrow {\n    display: inline-block;\n    width: 13px;\n    text-align: center;\n    color: #6c7086;\n    font-size: 8px;\n    cursor: pointer;\n    flex-shrink: 0;\n    user-select: none;\n    margin-right: 1px;\n}\n\n.di-arrow:hover { color: #cdd6f4; }\n\n/* Children */\n.di-children { display: block; }\n.di-children.di-collapsed { display: none; }\n\n/* ── Syntax colors ── */\n.di-tag    { color: #89b4fa; }\n.di-id     { color: #f9e2af; }\n.di-class  { color: #a6e3a1; }\n.di-attr   { color: #fab387; }\n.di-text   { color: #cba6f7; }\n\n/* ── Detail panel ── */\n.di-detail {\n    flex-shrink: 0;\n    border-top: 1px solid #313244;\n    background: #181825;\n    max-height: 220px;\n    overflow-y: auto;\n}\n\n.di-detail-header {\n    padding: 6px 14px;\n    font-size: 10px;\n    font-weight: 700;\n    color: #585b70;\n    text-transform: uppercase;\n    letter-spacing: 0.04em;\n    background: rgba(255,255,255,0.02);\n    border-bottom: 1px solid #313244;\n    position: sticky;\n    top: 0;\n}\n\n.di-detail-body {\n    padding: 8px 14px 10px;\n}\n\n.di-detail-placeholder {\n    color: #585b70;\n    font-size: 11px;\n    font-style: italic;\n}\n\n.di-detail-grid {\n    display: grid;\n    grid-template-columns: 52px 1fr;\n    gap: 2px 8px;\n    font-size: 11px;\n}\n\n.di-detail-label {\n    color: #585b70;\n    font-weight: 600;\n    text-align: right;\n    line-height: 20px;\n}\n\n.di-detail-val {\n    color: #cdd6f4;\n    word-break: break-all;\n    line-height: 20px;\n}\n\n.di-detail-text {\n    max-height: 38px;\n    overflow: hidden;\n    text-overflow: ellipsis;\n}\n\n.di-detail-selector {\n    margin-top: 8px;\n    padding-top: 6px;\n    border-top: 1px solid #313244;\n}\n\n.di-selector-row {\n    display: flex;\n    gap: 5px;\n    align-items: center;\n    margin-top: 4px;\n}\n\n.di-selector-actions {\n    display: flex;\n    gap: 4px;\n    flex-shrink: 0;\n}\n\n.di-selector-code {\n    flex: 1;\n    min-width: 0;\n    background: #11111b;\n    border: 1px solid #313244;\n    border-radius: 5px;\n    padding: 5px 9px;\n    font-size: 11px;\n    color: #f5c2e7;\n    overflow-x: auto;\n    white-space: nowrap;\n}\n\n.di-btn-copy,\n.di-btn-apply {\n    border: none;\n    border-radius: 5px;\n    padding: 5px 10px;\n    font-size: 12px;\n    cursor: pointer;\n    transition: all 0.12s;\n    flex-shrink: 0;\n    font-family: inherit;\n    font-weight: 600;\n}\n\n.di-btn-copy {\n    background: #313244;\n    color: #a6adc8;\n}\n\n.di-btn-copy:hover {\n    background: #45475a;\n    color: #cdd6f4;\n}\n\n.di-btn-apply {\n    background: #cba6f7;\n    color: #1e1e2e;\n}\n\n.di-btn-apply:hover {\n    background: #b4befe;\n    transform: translateY(-1px);\n}\n\n/* ── Inspector toggle button active state ── */\n.toki-btn-inspector.active {\n    background: #cba6f7 !important;\n    color: #1e1e2e !important;\n    border-color: #cba6f7 !important;\n    font-weight: 700 !important;\n}\n\n/* ── 구독 관리 패널 ── */\n.toki-btn-sub.active {\n    background: #f59e0b !important;\n    color: #1e293b !important;\n    border-color: #f59e0b !important;\n    font-weight: 700 !important;\n}\n\n.sub-panel {\n    flex: 1;\n    display: flex;\n    flex-direction: column;\n    gap: 12px;\n    overflow: hidden;\n    min-height: 0;\n}\n\n.sub-header {\n    font-size: 13px;\n    font-weight: 800;\n    color: #f59e0b;\n    padding-bottom: 8px;\n    border-bottom: 1px solid rgba(0,0,0,0.05);\n}\n\n.sub-add-area {\n    display: flex;\n    gap: 6px;\n    flex-wrap: wrap;\n}\n\n.sub-url-input {\n    flex: 3;\n    min-width: 200px;\n    box-sizing: border-box;\n    padding: 8px 12px;\n    background: rgba(255,255,255,0.7);\n    border: 1px solid rgba(0,0,0,0.06);\n    border-radius: 8px;\n    font-size: 12px;\n    font-family: inherit;\n}\n\n.sub-name-input {\n    flex: 1;\n    min-width: 100px;\n    box-sizing: border-box;\n    padding: 8px 12px;\n    background: rgba(255,255,255,0.7);\n    border: 1px solid rgba(0,0,0,0.06);\n    border-radius: 8px;\n    font-size: 12px;\n    font-family: inherit;\n}\n\n.sub-url-input:focus, .sub-name-input:focus {\n    outline: none;\n    border-color: #f59e0b;\n    background: #fff;\n}\n\n.sub-btn-add {\n    padding: 8px 14px;\n    background: #f59e0b;\n    color: #fff;\n    border: none;\n    border-radius: 8px;\n    font-size: 12px;\n    font-weight: 700;\n    cursor: pointer;\n    transition: all 0.15s;\n}\n\n.sub-btn-add:hover {\n    background: #d97706;\n    transform: translateY(-1px);\n}\n\n.sub-list {\n    flex: 1;\n    overflow-y: auto;\n    display: flex;\n    flex-direction: column;\n    gap: 8px;\n    min-height: 0;\n}\n\n.sub-list::-webkit-scrollbar { width: 5px; }\n.sub-list::-webkit-scrollbar-track { background: transparent; }\n.sub-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.08); border-radius: 999px; }\n\n.sub-empty {\n    padding: 24px 16px;\n    text-align: center;\n    color: #94a3b8;\n    font-size: 12px;\n    line-height: 1.6;\n    background: rgba(255,255,255,0.3);\n    border-radius: 12px;\n    border: 1px dashed rgba(0,0,0,0.06);\n}\n\n.sub-item {\n    display: flex;\n    justify-content: space-between;\n    align-items: center;\n    gap: 8px;\n    padding: 10px 12px;\n    background: rgba(255,255,255,0.4);\n    border: 1px solid rgba(0,0,0,0.04);\n    border-radius: 10px;\n    transition: all 0.15s;\n}\n\n.sub-item:hover {\n    background: rgba(255,255,255,0.6);\n}\n\n.sub-item-ok { border-left: 3px solid #10b981; }\n.sub-item-pending { border-left: 3px solid #f59e0b; }\n\n.sub-item-info {\n    flex: 1;\n    min-width: 0;\n}\n\n.sub-item-name {\n    font-size: 12px;\n    font-weight: 700;\n    color: #1e293b;\n}\n\n.sub-item-url {\n    font-size: 10px;\n    color: #64748b;\n    word-break: break-all;\n    margin-top: 2px;\n}\n\n.sub-item-meta {\n    font-size: 10px;\n    color: #94a3b8;\n    margin-top: 2px;\n}\n\n.sub-item-actions {\n    display: flex;\n    gap: 4px;\n    flex-shrink: 0;\n}\n\n.sub-btn-refresh-sm, .sub-btn-remove {\n    border: none;\n    border-radius: 6px;\n    padding: 4px 8px;\n    font-size: 13px;\n    cursor: pointer;\n    transition: all 0.15s;\n    background: rgba(0,0,0,0.03);\n}\n\n.sub-btn-refresh-sm:hover { background: #e2e8f0; }\n.sub-btn-remove:hover { background: #fee2e2; }\n\n.sub-actions {\n    display: flex;\n    gap: 8px;\n    align-items: center;\n    padding-top: 4px;\n}\n\n.sub-btn-refresh {\n    padding: 8px 16px;\n    background: #6366f1;\n    color: #fff;\n    border: none;\n    border-radius: 8px;\n    font-size: 12px;\n    font-weight: 700;\n    cursor: pointer;\n    transition: all 0.15s;\n}\n\n.sub-btn-refresh:hover {\n    background: #4f46e5;\n    transform: translateY(-1px);\n}\n\n.sub-status {\n    font-size: 11px;\n    color: #64748b;\n    flex: 1;\n    text-align: right;\n}\n\n/* ── Log Tab Bar ── */\n.toki-log-tabs {\n    display: flex;\n    align-items: center;\n    gap: 4px;\n    margin-bottom: 8px;\n    flex-shrink: 0;\n}\n\n.toki-log-tab-btn {\n    background: rgba(255, 255, 255, 0.04);\n    border: 1px solid transparent;\n    padding: 4px 12px;\n    border-radius: 6px;\n    cursor: pointer;\n    font-size: 11px;\n    font-weight: 600;\n    color: #94a3b8;\n    transition: all 0.15s;\n    font-family: inherit;\n}\n\n.toki-log-tab-btn:hover {\n    background: rgba(255, 255, 255, 0.1);\n    color: #e0e0e0;\n}\n\n.toki-log-tab-btn.active {\n    background: rgba(99, 102, 241, 0.15);\n    border-color: rgba(99, 102, 241, 0.3);\n    color: #a5b4fc;\n}\n\n.toki-log-tabs-right {\n    margin-left: auto;\n}\n\n.toki-log-tabs-right button {\n    background: none;\n    border: none;\n    cursor: pointer;\n    font-size: 12px;\n    color: #e6a23c;\n    padding: 4px 8px;\n    border-radius: 4px;\n    font-family: inherit;\n    transition: color 0.15s;\n}\n\n.toki-log-tabs-right button:hover {\n    color: #f59e0b;\n}\n\n/* ── Log Panels ── */\n.toki-log-panel {\n    display: none !important;\n    flex-direction: column;\n    flex: 1;\n    overflow: hidden;\n}\n\n.toki-log-panel.active {\n    display: flex !important;\n}\n\n/* ── Debug Console ── */\n#toki-debug-console-header {\n    display: flex;\n    align-items: center;\n    gap: 8px;\n    margin-bottom: 6px;\n    flex-shrink: 0;\n}\n\n.toki-console-toggle-btn {\n    background: rgba(255, 255, 255, 0.06);\n    border: 1px solid rgba(255, 255, 255, 0.1);\n    padding: 3px 10px;\n    border-radius: 4px;\n    cursor: pointer;\n    font-size: 11px;\n    color: #94a3b8;\n    font-family: inherit;\n    font-weight: 600;\n    transition: all 0.15s;\n}\n\n.toki-console-toggle-btn:hover {\n    background: rgba(255, 255, 255, 0.12);\n}\n\n.toki-console-toggle-btn.on {\n    color: #4ade80;\n    border-color: rgba(74, 222, 128, 0.3);\n}\n\n.toki-console-status {\n    font-size: 10px;\n    color: #64748b;\n}\n\n#toki-debug-console-content {\n    flex: 1;\n    overflow-y: auto;\n    padding: 8px;\n    margin: 0;\n    list-style: none;\n    background: rgba(0, 0, 0, 0.2);\n    border-radius: 8px;\n    border: 1px solid rgba(255, 255, 255, 0.03);\n    min-height: 280px;\n    font-family: 'Cascadia Code', Consolas, monospace;\n    font-size: 11px;\n}\n\n#toki-debug-console-content::-webkit-scrollbar {\n    width: 4px;\n}\n#toki-debug-console-content::-webkit-scrollbar-track {\n    background: transparent;\n}\n#toki-debug-console-content::-webkit-scrollbar-thumb {\n    background: rgba(255, 255, 255, 0.08);\n    border-radius: 999px;\n}\n\n#toki-debug-console-content li {\n    margin-bottom: 2px;\n    padding: 2px 6px;\n    border-radius: 3px;\n    word-break: break-all;\n    line-height: 1.5;\n}\n\n#toki-debug-console-content li.log,\n#toki-debug-console-content li.info {\n    color: #e0e0e0;\n}\n\n#toki-debug-console-content li.warn {\n    color: #f9e2af;\n}\n\n#toki-debug-console-content li.error,\n#toki-debug-console-content li.critical {\n    color: #f38ba8;\n}\n\n#toki-debug-console-content li.success {\n    color: #a6e3a1;\n}\n";
+var ui_namespaceObject = "@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');\r\n\r\n:root {\r\n    --toki-primary: #2563eb;\r\n    --toki-primary-dark: #1d4ed8;\r\n    --toki-accent: #facc15;\r\n    --toki-bg: rgba(248, 250, 252, 0.9);\r\n    --toki-text: #1e293b;\r\n    --toki-text-muted: #64748b;\r\n    --toki-border: rgba(255, 255, 255, 0.6);\r\n    --toki-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);\r\n    --toki-font: 'Inter', -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif;\r\n}\r\n\r\n/* LogBox Styles */\r\n#toki-logbox {\r\n    position: fixed;\r\n    bottom: 100px;\r\n    right: 30px;\r\n    width: 480px;\r\n    height: auto;\r\n    min-height: 250px;\r\n    max-height: 500px;\r\n    background: var(--toki-bg);\r\n    color: var(--toki-text);\r\n    font-family: 'Cascadia Code', Consolas, monospace;\r\n    font-size: 12px;\r\n    border: 1px solid var(--toki-border);\r\n    border-radius: 16px;\r\n    z-index: 9999;\r\n    display: none;\r\n    flex-direction: column;\r\n    box-shadow: var(--toki-shadow);\r\n    backdrop-filter: blur(20px);\r\n    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);\r\n}\r\n\r\n#toki-logbox-header {\r\n    padding: 12px 16px;\r\n    background: rgba(255, 255, 255, 0.4);\r\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    border-top-left-radius: 16px;\r\n    border-top-right-radius: 16px;\r\n    cursor: move;\r\n}\r\n\r\n#toki-logbox-title {\r\n    font-weight: 700;\r\n    font-size: 13px;\r\n    letter-spacing: -0.01em;\r\n}\r\n\r\n#toki-logbox-controls span {\r\n    cursor: pointer;\r\n    margin-left: 12px;\r\n    color: var(--toki-text-muted);\r\n    font-size: 14px;\r\n    transition: transform 0.2s, color 0.2s;\r\n    display: inline-block;\r\n}\r\n\r\n#toki-logbox-controls span:hover {\r\n    color: var(--toki-primary);\r\n    transform: scale(1.15);\r\n}\r\n\r\n#toki-logbox-content {\r\n    flex: 1;\r\n    overflow-y: auto;\r\n    padding: 12px;\r\n    margin: 0;\r\n    list-style: none;\r\n}\r\n\r\n#toki-logbox-content li {\r\n    margin-bottom: 4px;\r\n    word-break: break-all;\r\n    padding: 4px 8px;\r\n    border-radius: 6px;\r\n    line-height: 1.4;\r\n    color: #f1f5f9; /* 밝은 회백색 지정으로 가독성 극대화 */\r\n}\r\n\r\n#toki-logbox-content li.critical {\r\n    color: #be123c;\r\n    font-weight: 700;\r\n    background: rgba(225, 29, 72, 0.1);\r\n    border-left: 3px solid #e11d48;\r\n}\r\n\r\n#toki-logbox-content li.error { color: #e11d48; }\r\n#toki-logbox-content li.warn { color: #d97706; }\r\n#toki-logbox-content li.success { color: #059669; font-weight: 600; }\r\n#toki-logbox-content li.info { color: #38bdf8; font-weight: 500; }\r\n\r\n/* Modal Styles */\r\n.toki-modal-overlay {\r\n    position: fixed;\r\n    top: 0;\r\n    left: 0;\r\n    width: 100%;\r\n    height: 100%;\r\n    background: rgba(15, 23, 42, 0.2);\r\n    backdrop-filter: blur(12px);\r\n    z-index: 9999;\r\n    display: flex;\r\n    justify-content: center;\r\n    align-items: center;\r\n    opacity: 0;\r\n    animation: tokiFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;\r\n}\r\n\r\n.toki-modal {\r\n    width: 520px;\r\n    max-width: 95%;\r\n    background: var(--toki-bg);\r\n    border: 1px solid var(--toki-border);\r\n    border-radius: 28px;\r\n    box-shadow: var(--toki-shadow);\r\n    overflow: hidden;\r\n    display: flex;\r\n    flex-direction: column;\r\n    transform: translateY(30px) scale(0.95);\r\n    animation: tokiSlideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;\r\n    backdrop-filter: blur(30px);\r\n    color: var(--toki-text);\r\n    font-family: var(--toki-font);\r\n}\r\n\r\n.toki-modal-header {\r\n    padding: 24px 32px;\r\n    background: rgba(255, 255, 255, 0.4);\r\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n}\r\n\r\n.toki-modal-title {\r\n    font-size: 24px;\r\n    font-weight: 800;\r\n    color: #0f172a;\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 12px;\r\n    letter-spacing: -0.03em;\r\n}\r\n\r\n.toki-modal-close {\r\n    background: rgba(0, 0, 0, 0.05);\r\n    border: none;\r\n    color: var(--toki-text-muted);\r\n    width: 36px;\r\n    height: 36px;\r\n    border-radius: 50%;\r\n    cursor: pointer;\r\n    display: flex;\r\n    align-items: center;\r\n    justify-content: center;\r\n    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);\r\n    font-size: 20px;\r\n}\r\n\r\n.toki-modal-close:hover {\r\n    background: #ef4444;\r\n    color: #fff;\r\n    transform: rotate(90deg);\r\n}\r\n\r\n.toki-btn-ghost {\r\n    background: rgba(0, 0, 0, 0.05);\r\n    border: none;\r\n    color: var(--toki-text-muted);\r\n    padding: 6px 14px;\r\n    border-radius: 12px;\r\n    cursor: pointer;\r\n    display: flex;\r\n    align-items: center;\r\n    justify-content: center;\r\n    transition: all 0.2s;\r\n    font-size: 13px;\r\n    font-weight: 600;\r\n    gap: 6px;\r\n}\r\n\r\n.toki-btn-ghost:hover {\r\n    background: rgba(0, 0, 0, 0.08);\r\n    color: var(--toki-text);\r\n}\r\n\r\n/* Tabs */\r\n.toki-tabs {\r\n    display: flex;\r\n    background: rgba(255, 255, 255, 0.3);\r\n    padding: 8px;\r\n    gap: 6px;\r\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\r\n}\r\n\r\n.toki-tab-btn {\r\n    flex: 1;\r\n    padding: 12px;\r\n    background: none;\r\n    border: none;\r\n    color: var(--toki-text-muted);\r\n    font-size: 14px;\r\n    font-weight: 700;\r\n    cursor: pointer;\r\n    transition: all 0.3s;\r\n    border-radius: 14px;\r\n    display: flex;\r\n    justify-content: center;\r\n    align-items: center;\r\n    gap: 8px;\r\n}\r\n\r\n.toki-tab-btn:hover {\r\n    color: var(--toki-text);\r\n    background: rgba(255, 255, 255, 0.6);\r\n}\r\n\r\n.toki-tab-btn.active {\r\n    background: #fff;\r\n    color: var(--toki-primary);\r\n    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15);\r\n}\r\n\r\n.toki-tab-content {\r\n    display: none;\r\n    padding: 32px;\r\n    animation: tokiTabFadeIn 0.4s ease-out;\r\n}\r\n\r\n.toki-tab-content.active { display: block; }\r\n\r\n/* Components */\r\n.toki-section-title {\r\n    font-size: 11px;\r\n    font-weight: 800;\r\n    color: var(--toki-primary);\r\n    text-transform: uppercase;\r\n    letter-spacing: 0.1em;\r\n    margin: 24px 0 12px 4px;\r\n    opacity: 0.8;\r\n}\r\n\r\n.toki-control-group {\r\n    margin-bottom: 20px;\r\n    position: relative;\r\n}\r\n\r\n.toki-label {\r\n    display: block;\r\n    font-size: 13px;\r\n    font-weight: 700;\r\n    color: var(--toki-text-muted);\r\n    margin-bottom: 8px;\r\n    margin-left: 4px;\r\n}\r\n\r\n.toki-input, .toki-select, .toki-textarea {\r\n    box-sizing: border-box;\r\n    width: 100%;\r\n    padding: 14px 18px;\r\n    background: rgba(255, 255, 255, 0.8);\r\n    border: 1px solid rgba(0, 0, 0, 0.08);\r\n    border-radius: 16px;\r\n    color: var(--toki-text) !important;\r\n    font-size: 15px;\r\n    font-weight: 600;\r\n    appearance: none;\r\n    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);\r\n    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);\r\n}\r\n\r\n.toki-input:hover, .toki-select:hover, .toki-textarea:hover {\r\n    border-color: var(--toki-primary);\r\n    background-color: #fff;\r\n    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.08);\r\n}\r\n\r\n.toki-input:focus, .toki-select:focus, .toki-textarea:focus {\r\n    outline: none;\r\n    border-color: var(--toki-primary);\r\n    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1);\r\n    background-color: #fff;\r\n}\r\n\r\n.toki-textarea {\r\n    resize: vertical;\r\n    line-height: 1.5;\r\n}\r\n\r\n.toki-select {\r\n    cursor: pointer;\r\n    background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2364748b'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E\");\r\n    background-repeat: no-repeat;\r\n    background-position: right 16px center;\r\n    background-size: 16px;\r\n}\r\n\r\n.toki-btn-action {\r\n    width: 100%;\r\n    height: 56px;\r\n    background: var(--toki-primary);\r\n    color: #fff !important;\r\n    border: none;\r\n    border-radius: 18px;\r\n    font-size: 16px;\r\n    font-weight: 700;\r\n    cursor: pointer;\r\n    display: flex;\r\n    align-items: center;\r\n    justify-content: center;\r\n    gap: 12px;\r\n    transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);\r\n    box-shadow: 0 8px 15px rgba(37, 99, 235, 0.2);\r\n}\r\n\r\n.toki-btn-action:hover {\r\n    transform: translateY(-3px);\r\n    box-shadow: 0 12px 20px rgba(37, 99, 235, 0.35);\r\n    filter: brightness(1.05);\r\n}\r\n\r\n.toki-btn-secondary {\r\n    background: rgba(255, 255, 255, 0.8);\r\n    color: #475569 !important;\r\n    border: 1px solid rgba(0, 0, 0, 0.05);\r\n    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);\r\n}\r\n\r\n.toki-btn-secondary:hover {\r\n    background: #fff;\r\n    color: var(--toki-text) !important;\r\n}\r\n\r\n.toki-btn-danger {\r\n    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;\r\n    color: #ffffff !important;\r\n    border: none !important;\r\n    box-shadow: 0 4px 10px rgba(239, 68, 68, 0.2) !important;\r\n}\r\n\r\n.toki-btn-danger:hover {\r\n    background: linear-gradient(135deg, #f87171 0%, #ef4444 100%) !important;\r\n    box-shadow: 0 6px 15px rgba(239, 68, 68, 0.35) !important;\r\n}\r\n\r\n/* Status & Indicators */\r\n.toki-status-dot {\r\n    width: 8px;\r\n    height: 8px;\r\n    border-radius: 50%;\r\n    display: inline-block;\r\n    margin-right: 6px;\r\n}\r\n\r\n.toki-status-online {\r\n    background: #10b981;\r\n    box-shadow: 0 0 8px #10b981;\r\n}\r\n\r\n.toki-downloaded {\r\n    background: rgba(16, 185, 129, 0.08) !important;\r\n    border-left: 4px solid #10b981 !important;\r\n    opacity: 0.75;\r\n    transition: all 0.3s ease;\r\n}\r\n\r\n.toki-downloaded:hover {\r\n    opacity: 1;\r\n    background: rgba(16, 185, 129, 0.15) !important;\r\n}\r\n\r\n/* FAB */\r\n.toki-fab {\r\n    position: fixed;\r\n    bottom: 30px;\r\n    right: 30px;\r\n    width: 64px;\r\n    height: 64px;\r\n    background: linear-gradient(135deg, #2563eb, #0ea5e9);\r\n    border-radius: 20px;\r\n    box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.4);\r\n    display: flex;\r\n    justify-content: center;\r\n    align-items: center;\r\n    cursor: pointer;\r\n    transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);\r\n    z-index: 9998;\r\n}\r\n\r\n.toki-fab:hover {\r\n    transform: translateY(-5px) rotate(5deg);\r\n    box-shadow: 0 20px 25px -5px rgba(37, 99, 235, 0.5);\r\n}\r\n\r\n.toki-fab svg {\r\n    width: 28px;\r\n    height: 28px;\r\n    fill: #fff;\r\n}\r\n\r\n\r\n\r\n.toki-btn-rule {\r\n    background: transparent;\r\n    border: 1px solid #ddd;\r\n    padding: 6px 12px;\r\n    border-radius: 8px;\r\n    font-size: 12px;\r\n    cursor: pointer;\r\n    transition: all 0.2s;\r\n}\r\n\r\n.toki-btn-rule:hover {\r\n    background: #f8fafc;\r\n    border-color: #94a3b8;\r\n}\r\n\r\n/* Animations */\r\n@keyframes tokiFadeIn {\r\n    from { opacity: 0; }\r\n    to { opacity: 1; }\r\n}\r\n\r\n@keyframes tokiTabFadeIn {\r\n    from { opacity: 0; transform: translateX(10px); }\r\n    to { opacity: 1; transform: translateX(0); }\r\n}\r\n\r\n@keyframes tokiSlideUp {\r\n    from { opacity: 0; transform: translateY(30px) scale(0.95); }\r\n    to { opacity: 1; transform: translateY(0) scale(1); }\r\n}\r\n\r\n/* --- Structural Layouts for Inline Replacement --- */\r\n\r\n/* Horizontal Button Row (e.g., Download buttons) */\r\n.toki-btn-group-row {\r\n    display: flex;\r\n    gap: 12px;\r\n    align-items: center;\r\n}\r\n.toki-btn-group-row .toki-btn-action {\r\n    height: 52px;\r\n    flex: 1;\r\n}\r\n.toki-btn-group-row .toki-flex-1-4 {\r\n    flex: 1.4;\r\n}\r\n\r\n/* Vertical Button Stack (e.g., Tool buttons) */\r\n.toki-btn-group-stack {\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 8px;\r\n}\r\n.toki-btn-group-stack .toki-btn-action {\r\n    height: 44px;\r\n    justify-content: flex-start;\r\n    padding-left: 20px;\r\n}\r\n\r\n/* 1-Column Form Grid */\r\n.toki-form-grid {\r\n    display: grid;\r\n    grid-template-columns: 1fr;\r\n    gap: 14px;\r\n}\r\n\r\n/* Utility Shortcuts */\r\n.toki-flex-between { display: flex; justify-content: space-between; align-items: center; }\r\n.toki-divider { border: 0; border-top: 1px solid rgba(0,0,0,0.05); margin: 24px 0; }\r\n.toki-mt-0 { margin-top: 0 !important; }\r\n.toki-mt-8 { margin-top: 8px !important; }\r\n.toki-mt-32 { margin-top: 32px !important; }\r\n.toki-ml-4 { margin-left: 4px !important; }\r\n.toki-mb-5 { margin-bottom: 5px !important; }\r\n.toki-mb-10 { margin-bottom: 10px !important; }\r\n.toki-mb-24 { margin-bottom: 24px !important; }\r\n.toki-flex-1 { flex: 1; }\r\n.toki-flex-row { display: flex; gap: 4px; align-items: center; }\r\n.toki-flex-row-8 { display: flex; gap: 8px; align-items: center; }\r\n.toki-flex-row-10 { display: flex; gap: 10px; align-items: center; }\r\n\r\n/* Text Utilities */\r\n.toki-text-xs { font-size: 11px; color: #94a3b8; }\r\n.toki-text-sm { font-size: 12px; }\r\n.toki-text-base { font-size: 14px; }\r\n.toki-text-lg { font-size: 20px; font-weight: 700; }\r\n.toki-text-success { color: #4ade80 !important; }\r\n.toki-text-danger { color: #ff5555 !important; }\r\n.toki-text-primary { color: var(--toki-primary) !important; }\r\n.toki-text-center { text-align: center; }\r\n.toki-line-16 { line-height: 1.6; }\r\n\r\n/* Specialized Components */\r\n.toki-modal-main { padding: 32px; width: 520px; max-height: 85vh; overflow-y: auto; }\r\n.toki-btn-gradient-green { \r\n    background: linear-gradient(135deg, #10b981, #059669) !important; \r\n    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2) !important;\r\n}\r\n\r\n.toki-btn-lavender { background: #6a5acd !important; font-weight: bold !important; }\r\n.toki-btn-slate { background: rgba(0,0,0,0.02) !important; border-style: dashed !important; border-radius: 20px !important; }\r\n.toki-hidden { display: none !important; }\r\n\r\n/* Helper Boxes */\r\n.toki-helper-box-blue {\r\n    margin: -10px 0 20px 0; padding: 14px; \r\n    background: rgba(37, 99, 235, 0.05); border: 1px solid rgba(37, 99, 235, 0.1); \r\n    border-radius: 18px;\r\n}\r\n\r\n/* Captcha Overlay */\r\n.toki-captcha-overlay {\r\n    position: fixed; top: 0; left: 0; width: 100%; height: 100%;\r\n    background: rgba(0,0,0,0.8); z-index: 10001;\r\n    display: flex; flex-direction: column; align-items: center; justify-content: center;\r\n    color: white; font-family: var(--toki-font);\r\n}\r\n.toki-captcha-frame {\r\n    width: 80%; height: 60%; background: white; \r\n    border-radius: 20px; overflow: hidden; \r\n    margin-bottom: 20px; box-shadow: 0 20px 50px rgba(0,0,0,0.5);\r\n}\r\n\r\n/* Component: Helper Description Text */\r\n.toki-helper-desc { line-height: 1.5; font-weight: 500; }\r\n\r\n/* Component: Small Button (e.g., Test Native) */\r\n.toki-btn-sm { height: 36px !important; font-size: 12px !important; border-radius: 12px !important; }\r\n\r\n/* Component: Sync Button (height 48px) */\r\n.toki-btn-sync { height: 48px !important; }\r\n\r\n/* Component: Modal Header without border */\r\n.toki-modal-header-borderless { border: none !important; }\r\n\r\n/* Component: Code Textarea */\r\n.toki-textarea-code { min-height: 120px; font-family: monospace; }\r\n\r\n/* Visibility Toggles */\r\n.toki-visible-flex { display: flex !important; }\r\n.toki-visible-block { display: block !important; }\r\n.toki-hidden { display: none !important; }\r\n\r\n/* Status Badges & Indicators */\r\n.toki-badge {\r\n    margin-left: 5px;\r\n    font-size: 12px;\r\n    vertical-align: middle;\r\n}\r\n\r\n.toki-downloaded {\r\n    opacity: 0.6;\r\n    background-color: rgba(74, 222, 128, 0.05) !important;\r\n    transition: opacity 0.3s ease;\r\n}\r\n.toki-downloaded:hover {\r\n    opacity: 1;\r\n}\r\n\r\n/* Iframe Elements */\r\n.toki-downloader-iframe {\r\n    width: 100%;\r\n    height: 600px;\r\n    opacity: 0.1;\r\n    pointer-events: none;\r\n    border: none;\r\n    margin-top: 40px;\r\n}\r\n\r\n.toki-captcha-iframe {\r\n    width: 100%;\r\n    height: 100%;\r\n    border: none;\r\n}\r\n\r\n/* Info Card & History Styles */\r\n.toki-info-card {\r\n    background: rgba(255, 255, 255, 0.4);\r\n    border: 1px solid rgba(0, 0, 0, 0.05);\r\n    border-radius: 12px;\r\n    padding: 12px 16px;\r\n    margin-bottom: 20px;\r\n}\r\n\r\n.toki-info-row {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    padding: 6px 0;\r\n}\r\n\r\n.toki-info-row:not(:last-child) {\r\n    border-bottom: 1px dashed rgba(0, 0, 0, 0.05);\r\n}\r\n\r\n.toki-info-label {\r\n    font-size: 13px;\r\n    color: var(--toki-text-muted);\r\n    font-weight: 500;\r\n}\r\n\r\n.toki-info-val {\r\n    font-size: 13px;\r\n    color: var(--toki-text);\r\n    font-weight: 700;\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 6px;\r\n}\r\n\r\n/* --- Multi-Queue Progress Monitor Panel (v1.21.0) --- */\r\n#toki-logbox-progress {\r\n    padding: 14px 18px;\r\n    background: rgba(255, 255, 255, 0.25);\r\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\r\n    backdrop-filter: blur(10px);\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 8px;\r\n}\r\n\r\n#toki-progress-header {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n}\r\n\r\n#toki-progress-overall-text {\r\n    font-size: 12px;\r\n    font-weight: 800;\r\n    color: var(--toki-primary);\r\n    letter-spacing: -0.02em;\r\n    background: linear-gradient(135deg, #4f46e5, #06b6d4);\r\n    -webkit-background-clip: text;\r\n    -webkit-text-fill-color: transparent;\r\n}\r\n\r\n}\r\n\r\n#toki-progress-overall-controls {\r\n    display: flex;\r\n    gap: 8px;\r\n    align-items: center;\r\n}\r\n\r\n.toki-progress-btn {\r\n    font-size: 13px;\r\n    cursor: pointer;\r\n    transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275), filter 0.2s ease, opacity 0.2s ease;\r\n    user-select: none;\r\n    opacity: 0.85;\r\n}\r\n\r\n.toki-progress-btn:hover {\r\n    transform: scale(1.25);\r\n    opacity: 1;\r\n    filter: drop-shadow(0 0 5px rgba(255, 255, 255, 0.6));\r\n}\r\n\r\n#toki-btn-queue-stop:hover {\r\n    filter: drop-shadow(0 0 6px #ef4444);\r\n}\r\n\r\n.toki-progress-bar-paused {\r\n    background: linear-gradient(90deg, #9ca3af 0%, #6b7280 50%, #4b5563 100%) !important;\r\n    box-shadow: 0 1px 3px rgba(107, 114, 128, 0.4) !important;\r\n    animation: tokiPulsePaused 2s infinite ease-in-out;\r\n}\r\n\r\n@keyframes tokiPulsePaused {\r\n    0%, 100% { opacity: 1; }\r\n    50% { opacity: 0.65; }\r\n}\r\n\r\n.toki-empty-queue-msg {\r\n    display: flex;\r\n    flex-direction: column;\r\n    align-items: center;\r\n    justify-content: center;\r\n    padding: 24px 16px;\r\n    background: rgba(255, 255, 255, 0.04);\r\n    border: 1px dashed rgba(0, 0, 0, 0.08);\r\n    border-radius: 12px;\r\n    text-align: center;\r\n    gap: 6px;\r\n    margin: 8px 0;\r\n    backdrop-filter: blur(5px);\r\n}\r\n\r\n.toki-empty-queue-msg span {\r\n    font-size: 13px;\r\n    font-weight: 700;\r\n    color: var(--toki-primary, #6366f1);\r\n    opacity: 0.85;\r\n}\r\n\r\n.toki-empty-queue-msg p {\r\n    font-size: 11px;\r\n    color: #4b5563;\r\n    opacity: 0.75;\r\n    margin: 0;\r\n    line-height: 1.4;\r\n}\r\n\r\n.toki-progress-bar-container {\r\n    width: 100%;\r\n    height: 8px;\r\n    background: rgba(0, 0, 0, 0.06);\r\n    border-radius: 999px;\r\n    overflow: hidden;\r\n    position: relative;\r\n    border: 1px solid rgba(255, 255, 255, 0.5);\r\n    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);\r\n}\r\n\r\n.toki-progress-bar-fill {\r\n    height: 100%;\r\n    width: 0%;\r\n    background: linear-gradient(90deg, #6366f1 0%, #3b82f6 50%, #06b6d4 100%);\r\n    border-radius: 999px;\r\n    transition: width 0.4s cubic-bezier(0.16, 1, 0.3, 1);\r\n    box-shadow: 0 1px 3px rgba(99, 102, 241, 0.4);\r\n}\r\n\r\n#toki-progress-workers-list {\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 8px;\r\n    margin-top: 6px;\r\n    max-height: 160px;\r\n    overflow-y: auto;\r\n    padding-right: 4px;\r\n}\r\n\r\n/* Custom Scrollbar for Workers List */\r\n#toki-progress-workers-list::-webkit-scrollbar {\r\n    width: 4px;\r\n}\r\n#toki-progress-workers-list::-webkit-scrollbar-track {\r\n    background: transparent;\r\n}\r\n#toki-progress-workers-list::-webkit-scrollbar-thumb {\r\n    background: rgba(0, 0, 0, 0.1);\r\n    border-radius: 999px;\r\n}\r\n\r\n.toki-worker-progress-item {\r\n    background: rgba(255, 255, 255, 0.35);\r\n    border: 1px solid rgba(255, 255, 255, 0.5);\r\n    border-radius: 10px;\r\n    padding: 8px 12px;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 6px;\r\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);\r\n    transition: all 0.2s ease;\r\n}\r\n\r\n.toki-worker-progress-item:hover {\r\n    background: rgba(255, 255, 255, 0.55);\r\n    border-color: rgba(37, 99, 235, 0.15);\r\n    transform: translateY(-1px);\r\n    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.04);\r\n}\r\n\r\n.toki-worker-stage {\r\n    font-size: 11px;\r\n    font-weight: 700;\r\n    color: var(--toki-text-muted);\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n}\r\n\r\n.toki-worker-bar-container {\r\n    width: 100%;\r\n    height: 5px;\r\n    background: rgba(0, 0, 0, 0.04);\r\n    border-radius: 999px;\r\n    overflow: hidden;\r\n}\r\n\r\n.toki-worker-bar-fill {\r\n    height: 100%;\r\n    background: linear-gradient(90deg, #10b981 0%, #34d399 100%);\r\n    border-radius: 999px;\r\n    transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);\r\n}\r\n\r\n/* --- 📋 Realtime Queue List & Badges (v1.21.0) --- */\r\n#toki-progress-queue-section {\r\n    margin-top: 10px;\r\n    border-top: 1px solid rgba(0, 0, 0, 0.06);\r\n    padding-top: 8px;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 6px;\r\n}\r\n\r\n#toki-queue-section-header {\r\n    font-size: 11px;\r\n    font-weight: 700;\r\n    color: var(--toki-text-muted);\r\n    opacity: 0.85;\r\n}\r\n\r\n#toki-progress-queue-list {\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 4px;\r\n    max-height: 120px;\r\n    overflow-y: auto;\r\n    padding-right: 2px;\r\n}\r\n\r\n#toki-progress-queue-list::-webkit-scrollbar {\r\n    width: 4px;\r\n}\r\n#toki-progress-queue-list::-webkit-scrollbar-track {\r\n    background: transparent;\r\n}\r\n#toki-progress-queue-list::-webkit-scrollbar-thumb {\r\n    background: rgba(0, 0, 0, 0.08);\r\n    border-radius: 999px;\r\n}\r\n\r\n.toki-queue-list-item {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    padding: 5px 8px;\r\n    background: rgba(255, 255, 255, 0.25);\r\n    border: 1px solid rgba(255, 255, 255, 0.4);\r\n    border-radius: 6px;\r\n    font-size: 11px;\r\n    transition: all 0.2s ease;\r\n}\r\n\r\n.toki-queue-list-item:hover {\r\n    background: rgba(255, 255, 255, 0.45);\r\n    transform: translateX(1px);\r\n}\r\n\r\n.toki-queue-item-meta {\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 8px;\r\n    flex: 1;\r\n    min-width: 0;\r\n}\r\n\r\n.toki-queue-item-title {\r\n    color: var(--toki-text);\r\n    font-weight: 500;\r\n    white-space: nowrap;\r\n    overflow: hidden;\r\n    text-overflow: ellipsis;\r\n}\r\n\r\n.toki-queue-item-delete {\r\n    font-size: 10px;\r\n    cursor: pointer;\r\n    opacity: 0.6;\r\n    transition: all 0.15s ease;\r\n    padding: 2px;\r\n}\r\n\r\n.toki-queue-item-delete:hover {\r\n    opacity: 1;\r\n    transform: scale(1.2);\r\n}\r\n\r\n/* 세련된 HSL 상태 배지 */\r\n.toki-badge {\r\n    padding: 2px 6px;\r\n    border-radius: 4px;\r\n    font-size: 9px;\r\n    font-weight: 700;\r\n    white-space: nowrap;\r\n    text-transform: uppercase;\r\n}\r\n\r\n/* 대기 (🟡 HSL Tailored Yellow) */\r\n.toki-badge-pending {\r\n    background: hsl(45, 93%, 94%);\r\n    color: hsl(45, 90%, 35%);\r\n    border: 1px solid hsl(45, 93%, 85%);\r\n}\r\n\r\n/* 진행 (🟢 HSL Tailored Emerald) */\r\n.toki-badge-processing {\r\n    background: hsl(150, 84%, 93%);\r\n    color: hsl(150, 84%, 25%);\r\n    border: 1px solid hsl(150, 84%, 82%);\r\n}\r\n\r\n/* 완료 (🔵 HSL Tailored Sapphire) */\r\n.toki-badge-completed {\r\n    background: hsl(220, 95%, 94%);\r\n    color: hsl(220, 90%, 40%);\r\n    border: 1px solid hsl(220, 95%, 86%);\r\n}\r\n\r\n/* 실패 (🔴 HSL Tailored Ruby) */\r\n.toki-badge-failed {\r\n    background: hsl(0, 93%, 94%);\r\n    color: hsl(0, 90%, 45%);\r\n    border: 1px solid hsl(0, 93%, 86%);\r\n}\r\n\r\n/* --- FormRuleEditor: Hybrid Two-Track Parser GUI (v1.21.0) --- */\r\n.toki-form-editor-modal {\r\n    width: min(95vw, 1200px) !important;\r\n    max-height: min(85vh, 700px) !important;\r\n    border-radius: 24px !important;\r\n}\r\n\r\n.toki-form-editor-container {\r\n    display: flex !important;\r\n    flex-direction: row !important;\r\n    flex-wrap: nowrap !important;\r\n    flex: 1;\r\n    overflow: auto !important;\r\n    gap: 20px;\r\n    padding: 20px;\r\n    background: rgba(255, 255, 255, 0.15);\r\n}\r\n\r\n.toki-form-editor-left {\r\n    flex: 1.2 !important;\r\n    min-width: 550px !important;\r\n    overflow-y: auto;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 16px;\r\n    padding-right: 8px;\r\n}\r\n\r\n.toki-form-editor-left::-webkit-scrollbar {\r\n    width: 6px;\r\n}\r\n.toki-form-editor-left::-webkit-scrollbar-track {\r\n    background: transparent;\r\n}\r\n.toki-form-editor-left::-webkit-scrollbar-thumb {\r\n    background: rgba(0, 0, 0, 0.08);\r\n    border-radius: 999px;\r\n}\r\n\r\n.toki-form-editor-right {\r\n    flex: 1 !important;\r\n    min-width: 450px !important;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 16px;\r\n    background: rgba(255, 255, 255, 0.4);\r\n    padding: 20px;\r\n    border-radius: 18px;\r\n    border: 1px solid rgba(255, 255, 255, 0.5);\r\n    overflow: hidden;\r\n}\r\n\r\n.toki-form-card {\r\n    background: rgba(255, 255, 255, 0.45);\r\n    border: 1px solid rgba(0, 0, 0, 0.04);\r\n    border-radius: 16px;\r\n    padding: 16px 20px;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 12px;\r\n    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.01);\r\n    transition: all 0.2s ease;\r\n}\r\n\r\n.toki-form-card:hover {\r\n    background: rgba(255, 255, 255, 0.65);\r\n    border-color: rgba(37, 99, 235, 0.1);\r\n    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.02);\r\n}\r\n\r\n.toki-form-card-title {\r\n    font-size: 13px;\r\n    font-weight: 800;\r\n    color: var(--toki-primary);\r\n    text-transform: uppercase;\r\n    letter-spacing: 0.02em;\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    border-bottom: 1px solid rgba(0, 0, 0, 0.03);\r\n    padding-bottom: 8px;\r\n}\r\n\r\n.toki-form-row {\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 6px;\r\n}\r\n\r\n.toki-form-row-header {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n}\r\n\r\n.toki-form-row-label {\r\n    font-size: 12px;\r\n    font-weight: 700;\r\n    color: var(--toki-text-muted);\r\n}\r\n\r\n.toki-input-compact {\r\n    width: 100%;\r\n    box-sizing: border-box;\r\n    min-width: 0;\r\n    padding: 10px 14px;\r\n    background: rgba(255, 255, 255, 0.7);\r\n    border: 1px solid rgba(0, 0, 0, 0.06);\r\n    border-radius: 10px;\r\n    font-size: 13px;\r\n    font-family: inherit;\r\n    transition: all 0.2s ease;\r\n}\r\n\r\n.toki-input-compact:focus {\r\n    outline: none;\r\n    border-color: var(--toki-primary);\r\n    background: #fff;\r\n    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);\r\n}\r\n\r\n.toki-badge-match {\r\n    font-size: 10px;\r\n    font-weight: 800;\r\n    padding: 2px 6px;\r\n    border-radius: 6px;\r\n    transition: all 0.2s ease;\r\n}\r\n\r\n.toki-badge-match.ok {\r\n    background: rgba(16, 185, 129, 0.1);\r\n    color: #10b981;\r\n}\r\n\r\n.toki-badge-match.zero {\r\n    background: rgba(245, 158, 11, 0.1);\r\n    color: #f59e0b;\r\n}\r\n\r\n.toki-badge-match.error {\r\n    background: rgba(239, 68, 68, 0.1);\r\n    color: #ef4444;\r\n}\r\n\r\n.toki-form-dropper-btn {\r\n    cursor: pointer;\r\n    font-size: 14px;\r\n    transition: transform 0.2s;\r\n    user-select: none;\r\n}\r\n.toki-form-dropper-btn:hover {\r\n    transform: scale(1.2);\r\n}\r\n\r\n.toki-form-verify-btn {\r\n    cursor: pointer;\r\n    font-size: 14px;\r\n    transition: transform 0.2s;\r\n    user-select: none;\r\n}\r\n.toki-form-verify-btn:hover {\r\n    transform: scale(1.2);\r\n}\r\n\r\n.toki-form-verify-result {\r\n    font-size: 11px;\r\n    font-weight: 600;\r\n    margin-top: 4px;\r\n    padding: 6px 10px;\r\n    border-radius: 8px;\r\n    line-height: 1.4;\r\n    word-break: break-all;\r\n}\r\n.toki-form-verify-result.success {\r\n    background: rgba(16, 185, 129, 0.08);\r\n    color: #10b981;\r\n    border: 1px solid rgba(16, 185, 129, 0.15);\r\n}\r\n.toki-form-verify-result.error {\r\n    background: rgba(239, 68, 68, 0.08);\r\n    color: #ef4444;\r\n    border: 1px solid rgba(239, 68, 68, 0.15);\r\n}\r\n\r\n/* --- 📱 Compact Responsive LogBox for Popups & Small Screens (v1.21.0 추가) --- */\r\n@media (max-width: 500px) {\r\n    #toki-logbox {\r\n        width: 100% !important;\r\n        height: 100% !important;\r\n        max-height: 100% !important;\r\n        bottom: 0 !important;\r\n        right: 0 !important;\r\n        left: 0 !important;\r\n        top: 0 !important;\r\n        border-radius: 0 !important;\r\n        border: none !important;\r\n        box-shadow: none !important;\r\n    }\r\n    /* 팝업에서는 전체 화면을 채우므로 드래그 헤더 무효화 및 모바일 친화형 축소 */\r\n    #toki-logbox-header {\r\n        cursor: default !important;\r\n        padding: 8px 12px !important;\r\n        border-top-left-radius: 0 !important;\r\n        border-top-right-radius: 0 !important;\r\n    }\r\n    #toki-logbox-content {\r\n        padding: 8px !important;\r\n        display: block !important; /* 팝업 상세로그 강제 개방 */\r\n        height: calc(100% - 35px) !important; /* 헤더를 제외한 영역 100% 점유 */\r\n        max-height: calc(100% - 35px) !important;\r\n    }\r\n    /* 팝업 내 불필요한 컨트롤 및 큐 진행률 카드 영역 강제 은닉 (사용자 피드백 반영) */\r\n    #toki-btn-audio, #toki-btn-report, #toki-logbox-progress {\r\n        display: none !important;\r\n    }\r\n}\r\n\r\n\r\n\r\n\r\n/* --- Dashboard Popup Specific Layout --- */\r\n#toki-dashboard-popup {\r\n    display: flex;\r\n    flex-direction: column;\r\n    width: 100vw;\r\n    height: 100vh;\r\n    margin: 0;\r\n    background: var(--toki-bg);\r\n    border: none;\r\n    border-radius: 0;\r\n    box-shadow: none;\r\n    overflow: hidden;\r\n}\r\n\r\n#toki-dashboard-header {\r\n    padding: 24px 32px;\r\n    background: rgba(255, 255, 255, 0.4);\r\n    border-bottom: 1px solid rgba(0, 0, 0, 0.05);\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n}\r\n\r\n#toki-dashboard-title {\r\n    font-size: 24px;\r\n    font-weight: 800;\r\n    color: #0f172a;\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 12px;\r\n    letter-spacing: -0.03em;\r\n}\r\n\r\n#toki-dashboard-header-controls {\r\n    display: flex;\r\n    gap: 12px;\r\n    align-items: center;\r\n}\r\n\r\n#toki-dashboard-log-section {\r\n    padding: 16px 20px;\r\n    background: rgba(0, 0, 0, 0.05);\r\n    border-radius: 12px;\r\n    margin: 0 20px 20px 20px;\r\n    display: flex;\r\n    flex-direction: column;\r\n    height: 250px; /* 실시간 로그창 영역 높이 명시 */\r\n    overflow: hidden;\r\n}\r\n\r\n#toki-dashboard-log-section #toki-logbox-content {\r\n    flex: 1;\r\n    overflow-y: auto; /* 내부 스크롤 강제 */\r\n    padding: 12px;\r\n    margin: 0;\r\n    list-style: none;\r\n    background: rgba(0, 0, 0, 0.2); /* 로그 시인성 제고를 위한 세련된 다크 패널 */\r\n    border-radius: 8px;\r\n    border: 1px solid rgba(255, 255, 255, 0.03);\r\n}\r\n\r\n#toki-log-header {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    font-weight: 700;\r\n    margin-bottom: 12px;\r\n    color: var(--toki-text-muted);\r\n}\r\n\r\n/* --- 대시보드 커스텀 모달 레이아웃 (v1.21.6 추가) --- */\r\n.toki-dashboard-modal-overlay {\r\n    position: fixed;\r\n    top: 0;\r\n    left: 0;\r\n    width: 100vw;\r\n    height: 100vh;\r\n    background: rgba(15, 23, 42, 0.75);\r\n    backdrop-filter: blur(8px);\r\n    z-index: 10005;\r\n    display: flex;\r\n    align-items: center;\r\n    justify-content: center;\r\n    animation: tokiFadeIn 0.25s ease-out;\r\n}\r\n\r\n.toki-dashboard-modal {\r\n    width: 90%;\r\n    max-width: 680px;\r\n    background: var(--toki-bg, #1a1a2e);\r\n    border: 1px solid rgba(255, 255, 255, 0.08);\r\n    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);\r\n    border-radius: 24px;\r\n    display: flex;\r\n    flex-direction: column;\r\n    overflow: hidden;\r\n    animation: tokiSlideUp 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);\r\n    color: #e0e0e0;\r\n}\r\n\r\n.toki-dashboard-modal-header {\r\n    padding: 18px 24px;\r\n    border-bottom: 1px solid rgba(255, 255, 255, 0.05);\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    background: rgba(255, 255, 255, 0.02);\r\n}\r\n\r\n.toki-dashboard-modal-title {\r\n    font-size: 15px;\r\n    font-weight: 800;\r\n    color: var(--toki-primary, #6366f1);\r\n}\r\n\r\n.toki-dashboard-modal-close {\r\n    background: transparent;\r\n    border: none;\r\n    font-size: 24px;\r\n    font-weight: 700;\r\n    color: #94a3b8;\r\n    cursor: pointer;\r\n    line-height: 1;\r\n    transition: all 0.2s ease;\r\n}\r\n\r\n.toki-dashboard-modal-close:hover {\r\n    color: #ef4444;\r\n    transform: scale(1.1);\r\n}\r\n\r\n.toki-dashboard-modal-content {\r\n    padding: 20px;\r\n    overflow-y: auto;\r\n    max-height: 75vh;\r\n}\r\n\r\n/* 진행상황 모달 내 레이아웃 오버라이드 */\r\n#toki-modal-progress #toki-logbox-progress {\r\n    background: transparent !important;\r\n    border: none !important;\r\n    padding: 0 !important;\r\n    backdrop-filter: none !important;\r\n}\r\n#toki-modal-progress #toki-progress-queue-list {\r\n    max-height: 220px;\r\n}\r\n\r\n/* 로그 모달 내 레이아웃 오버라이드 */\r\n#toki-modal-logs #toki-dashboard-log-section {\r\n    margin: 0 !important;\r\n    padding: 0 !important;\r\n    background: transparent !important;\r\n    height: 400px !important;\r\n}\r\n#toki-modal-logs .toki-log-panel {\r\n    height: 330px !important;\r\n    max-height: 330px !important;\r\n    overflow-y: auto;\r\n}\r\n\r\n/* 대기열 모달 최대화 시의 너비 및 리스트 세로 높이 확장 */\r\n.toki-dashboard-modal-overlay.toki-queue-maximized .toki-dashboard-modal {\r\n    max-width: 850px !important;\r\n}\r\n.toki-dashboard-modal-overlay.toki-queue-maximized #toki-progress-queue-list {\r\n    max-height: 480px !important;\r\n    height: 480px !important;\r\n}\r\n\r\n/* 탭 본문 영역 세로 스크롤 활성화 (v1.21.8) */\r\n.toki-modal-body {\r\n    flex: 1;\r\n    overflow-y: auto !important;\r\n    max-height: calc(100vh - 120px);\r\n    padding-bottom: 40px;\r\n}\r\n\r\n/* Custom Scrollbar for Modal Body */\r\n.toki-modal-body::-webkit-scrollbar {\r\n    width: 6px;\r\n}\r\n.toki-modal-body::-webkit-scrollbar-track {\r\n    background: transparent;\r\n}\r\n.toki-modal-body::-webkit-scrollbar-thumb {\r\n    background: rgba(0, 0, 0, 0.12);\r\n    border-radius: 999px;\r\n}\r\n.toki-modal-body::-webkit-scrollbar-thumb:hover {\r\n    background: rgba(0, 0, 0, 0.25);\r\n}\r\n\r\n/* --- 🧬 DOM Inspector Panel (v2 — DevTools Style) --- */\r\n.toki-inspector-mount {\r\n    flex: 1;\r\n    display: flex;\r\n    flex-direction: column;\r\n    overflow: hidden;\r\n    min-height: 0;\r\n    border-radius: 12px;\r\n}\r\n\r\n.di-panel {\r\n    flex: 1;\r\n    display: flex;\r\n    flex-direction: column;\r\n    background: #1e1e2e;\r\n    overflow: hidden;\r\n    font-family: 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;\r\n    font-size: 12px;\r\n    line-height: 1.6;\r\n    color: #cdd6f4;\r\n}\r\n\r\n/* ── Toolbar ── */\r\n.di-toolbar {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    padding: 7px 14px;\r\n    background: #181825;\r\n    border-bottom: 1px solid #313244;\r\n    flex-shrink: 0;\r\n}\r\n\r\n.di-title {\r\n    font-weight: 700;\r\n    font-size: 12px;\r\n    color: #cba6f7;\r\n    letter-spacing: -0.01em;\r\n}\r\n\r\n.di-toolbar-right {\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 10px;\r\n}\r\n\r\n.di-count {\r\n    font-size: 10px;\r\n    color: #585b70;\r\n}\r\n\r\n.di-refresh {\r\n    background: #313244;\r\n    border: none;\r\n    border-radius: 5px;\r\n    color: #6c7086;\r\n    cursor: pointer;\r\n    padding: 1px 7px;\r\n    font-size: 14px;\r\n    line-height: 1.5;\r\n    transition: all 0.15s;\r\n}\r\n\r\n.di-refresh:hover {\r\n    background: #45475a;\r\n    color: #cdd6f4;\r\n}\r\n\r\n/* ── Filter ── */\r\n.di-filter-bar {\r\n    padding: 5px 14px;\r\n    background: #181825;\r\n    border-bottom: 1px solid #313244;\r\n    flex-shrink: 0;\r\n}\r\n\r\n.di-filter {\r\n    width: 100%;\r\n    box-sizing: border-box;\r\n    background: #313244;\r\n    border: 1px solid #45475a;\r\n    border-radius: 5px;\r\n    padding: 4px 9px;\r\n    font-size: 11px;\r\n    color: #cdd6f4;\r\n    font-family: inherit;\r\n    outline: none;\r\n}\r\n\r\n.di-filter::placeholder { color: #585b70; }\r\n.di-filter:focus { border-color: #cba6f7; }\r\n\r\n/* ── Tree area ── */\r\n.di-tree-wrap {\r\n    flex: 1;\r\n    overflow-y: auto;\r\n    overflow-x: auto;\r\n    min-height: 0;\r\n    background: #1e1e2e;\r\n}\r\n\r\n.di-tree-wrap::-webkit-scrollbar { width: 4px; height: 4px; }\r\n.di-tree-wrap::-webkit-scrollbar-track { background: transparent; }\r\n.di-tree-wrap::-webkit-scrollbar-thumb { background: #45475a; border-radius: 999px; }\r\n\r\n.di-tree {\r\n    padding: 2px 0;\r\n}\r\n\r\n/* ── Tree lines ── */\r\n.di-line {\r\n    padding: 0 14px 0 0;\r\n    cursor: pointer;\r\n    white-space: nowrap;\r\n    font-size: 11px;\r\n    line-height: 22px;\r\n    user-select: none;\r\n    border-left: 2px solid transparent;\r\n}\r\n\r\n.di-line:hover {\r\n    background: rgba(203, 166, 247, 0.06);\r\n}\r\n\r\n.di-line.di-selected {\r\n    background: rgba(203, 166, 247, 0.12);\r\n    border-left-color: #cba6f7;\r\n}\r\n\r\n.di-line.di-dimmed { opacity: 0.35; }\r\n\r\n.di-arrow {\r\n    display: inline-block;\r\n    width: 13px;\r\n    text-align: center;\r\n    color: #6c7086;\r\n    font-size: 8px;\r\n    cursor: pointer;\r\n    flex-shrink: 0;\r\n    user-select: none;\r\n    margin-right: 1px;\r\n}\r\n\r\n.di-arrow:hover { color: #cdd6f4; }\r\n\r\n/* Children */\r\n.di-children { display: block; }\r\n.di-children.di-collapsed { display: none; }\r\n\r\n/* ── Syntax colors ── */\r\n.di-tag    { color: #89b4fa; }\r\n.di-id     { color: #f9e2af; }\r\n.di-class  { color: #a6e3a1; }\r\n.di-attr   { color: #fab387; }\r\n.di-text   { color: #cba6f7; }\r\n\r\n/* ── Detail panel ── */\r\n.di-detail {\r\n    flex-shrink: 0;\r\n    border-top: 1px solid #313244;\r\n    background: #181825;\r\n    max-height: 220px;\r\n    overflow-y: auto;\r\n}\r\n\r\n.di-detail-header {\r\n    padding: 6px 14px;\r\n    font-size: 10px;\r\n    font-weight: 700;\r\n    color: #585b70;\r\n    text-transform: uppercase;\r\n    letter-spacing: 0.04em;\r\n    background: rgba(255,255,255,0.02);\r\n    border-bottom: 1px solid #313244;\r\n    position: sticky;\r\n    top: 0;\r\n}\r\n\r\n.di-detail-body {\r\n    padding: 8px 14px 10px;\r\n}\r\n\r\n.di-detail-placeholder {\r\n    color: #585b70;\r\n    font-size: 11px;\r\n    font-style: italic;\r\n}\r\n\r\n.di-detail-grid {\r\n    display: grid;\r\n    grid-template-columns: 52px 1fr;\r\n    gap: 2px 8px;\r\n    font-size: 11px;\r\n}\r\n\r\n.di-detail-label {\r\n    color: #585b70;\r\n    font-weight: 600;\r\n    text-align: right;\r\n    line-height: 20px;\r\n}\r\n\r\n.di-detail-val {\r\n    color: #cdd6f4;\r\n    word-break: break-all;\r\n    line-height: 20px;\r\n}\r\n\r\n.di-detail-text {\r\n    max-height: 38px;\r\n    overflow: hidden;\r\n    text-overflow: ellipsis;\r\n}\r\n\r\n.di-detail-selector {\r\n    margin-top: 8px;\r\n    padding-top: 6px;\r\n    border-top: 1px solid #313244;\r\n}\r\n\r\n.di-selector-row {\r\n    display: flex;\r\n    gap: 5px;\r\n    align-items: center;\r\n    margin-top: 4px;\r\n}\r\n\r\n.di-selector-actions {\r\n    display: flex;\r\n    gap: 4px;\r\n    flex-shrink: 0;\r\n}\r\n\r\n.di-selector-code {\r\n    flex: 1;\r\n    min-width: 0;\r\n    background: #11111b;\r\n    border: 1px solid #313244;\r\n    border-radius: 5px;\r\n    padding: 5px 9px;\r\n    font-size: 11px;\r\n    color: #f5c2e7;\r\n    overflow-x: auto;\r\n    white-space: nowrap;\r\n}\r\n\r\n.di-btn-copy,\r\n.di-btn-apply {\r\n    border: none;\r\n    border-radius: 5px;\r\n    padding: 5px 10px;\r\n    font-size: 12px;\r\n    cursor: pointer;\r\n    transition: all 0.12s;\r\n    flex-shrink: 0;\r\n    font-family: inherit;\r\n    font-weight: 600;\r\n}\r\n\r\n.di-btn-copy {\r\n    background: #313244;\r\n    color: #a6adc8;\r\n}\r\n\r\n.di-btn-copy:hover {\r\n    background: #45475a;\r\n    color: #cdd6f4;\r\n}\r\n\r\n.di-btn-apply {\r\n    background: #cba6f7;\r\n    color: #1e1e2e;\r\n}\r\n\r\n.di-btn-apply:hover {\r\n    background: #b4befe;\r\n    transform: translateY(-1px);\r\n}\r\n\r\n/* ── Inspector toggle button active state ── */\r\n.toki-btn-inspector.active {\r\n    background: #cba6f7 !important;\r\n    color: #1e1e2e !important;\r\n    border-color: #cba6f7 !important;\r\n    font-weight: 700 !important;\r\n}\r\n\r\n/* ── 구독 관리 패널 ── */\r\n.toki-btn-sub.active {\r\n    background: #f59e0b !important;\r\n    color: #1e293b !important;\r\n    border-color: #f59e0b !important;\r\n    font-weight: 700 !important;\r\n}\r\n\r\n.sub-panel {\r\n    flex: 1;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 12px;\r\n    overflow: hidden;\r\n    min-height: 0;\r\n}\r\n\r\n.sub-header {\r\n    font-size: 13px;\r\n    font-weight: 800;\r\n    color: #f59e0b;\r\n    padding-bottom: 8px;\r\n    border-bottom: 1px solid rgba(0,0,0,0.05);\r\n}\r\n\r\n.sub-add-area {\r\n    display: flex;\r\n    gap: 6px;\r\n    flex-wrap: wrap;\r\n}\r\n\r\n.sub-url-input {\r\n    flex: 3;\r\n    min-width: 200px;\r\n    box-sizing: border-box;\r\n    padding: 8px 12px;\r\n    background: rgba(255,255,255,0.7);\r\n    border: 1px solid rgba(0,0,0,0.06);\r\n    border-radius: 8px;\r\n    font-size: 12px;\r\n    font-family: inherit;\r\n}\r\n\r\n.sub-name-input {\r\n    flex: 1;\r\n    min-width: 100px;\r\n    box-sizing: border-box;\r\n    padding: 8px 12px;\r\n    background: rgba(255,255,255,0.7);\r\n    border: 1px solid rgba(0,0,0,0.06);\r\n    border-radius: 8px;\r\n    font-size: 12px;\r\n    font-family: inherit;\r\n}\r\n\r\n.sub-url-input:focus, .sub-name-input:focus {\r\n    outline: none;\r\n    border-color: #f59e0b;\r\n    background: #fff;\r\n}\r\n\r\n.sub-btn-add {\r\n    padding: 8px 14px;\r\n    background: #f59e0b;\r\n    color: #fff;\r\n    border: none;\r\n    border-radius: 8px;\r\n    font-size: 12px;\r\n    font-weight: 700;\r\n    cursor: pointer;\r\n    transition: all 0.15s;\r\n}\r\n\r\n.sub-btn-add:hover {\r\n    background: #d97706;\r\n    transform: translateY(-1px);\r\n}\r\n\r\n.sub-list {\r\n    flex: 1;\r\n    overflow-y: auto;\r\n    display: flex;\r\n    flex-direction: column;\r\n    gap: 8px;\r\n    min-height: 0;\r\n}\r\n\r\n.sub-list::-webkit-scrollbar { width: 5px; }\r\n.sub-list::-webkit-scrollbar-track { background: transparent; }\r\n.sub-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.08); border-radius: 999px; }\r\n\r\n.sub-empty {\r\n    padding: 24px 16px;\r\n    text-align: center;\r\n    color: #94a3b8;\r\n    font-size: 12px;\r\n    line-height: 1.6;\r\n    background: rgba(255,255,255,0.3);\r\n    border-radius: 12px;\r\n    border: 1px dashed rgba(0,0,0,0.06);\r\n}\r\n\r\n.sub-item {\r\n    display: flex;\r\n    justify-content: space-between;\r\n    align-items: center;\r\n    gap: 8px;\r\n    padding: 10px 12px;\r\n    background: rgba(255,255,255,0.4);\r\n    border: 1px solid rgba(0,0,0,0.04);\r\n    border-radius: 10px;\r\n    transition: all 0.15s;\r\n}\r\n\r\n.sub-item:hover {\r\n    background: rgba(255,255,255,0.6);\r\n}\r\n\r\n.sub-item-ok { border-left: 3px solid #10b981; }\r\n.sub-item-pending { border-left: 3px solid #f59e0b; }\r\n\r\n.sub-item-info {\r\n    flex: 1;\r\n    min-width: 0;\r\n}\r\n\r\n.sub-item-name {\r\n    font-size: 12px;\r\n    font-weight: 700;\r\n    color: #1e293b;\r\n}\r\n\r\n.sub-item-url {\r\n    font-size: 10px;\r\n    color: #64748b;\r\n    word-break: break-all;\r\n    margin-top: 2px;\r\n}\r\n\r\n.sub-item-meta {\r\n    font-size: 10px;\r\n    color: #94a3b8;\r\n    margin-top: 2px;\r\n}\r\n\r\n.sub-item-actions {\r\n    display: flex;\r\n    gap: 4px;\r\n    flex-shrink: 0;\r\n}\r\n\r\n.sub-btn-refresh-sm, .sub-btn-remove {\r\n    border: none;\r\n    border-radius: 6px;\r\n    padding: 4px 8px;\r\n    font-size: 13px;\r\n    cursor: pointer;\r\n    transition: all 0.15s;\r\n    background: rgba(0,0,0,0.03);\r\n}\r\n\r\n.sub-btn-refresh-sm:hover { background: #e2e8f0; }\r\n.sub-btn-remove:hover { background: #fee2e2; }\r\n\r\n.sub-actions {\r\n    display: flex;\r\n    gap: 8px;\r\n    align-items: center;\r\n    padding-top: 4px;\r\n}\r\n\r\n.sub-btn-refresh {\r\n    padding: 8px 16px;\r\n    background: #6366f1;\r\n    color: #fff;\r\n    border: none;\r\n    border-radius: 8px;\r\n    font-size: 12px;\r\n    font-weight: 700;\r\n    cursor: pointer;\r\n    transition: all 0.15s;\r\n}\r\n\r\n.sub-btn-refresh:hover {\r\n    background: #4f46e5;\r\n    transform: translateY(-1px);\r\n}\r\n\r\n.sub-status {\r\n    font-size: 11px;\r\n    color: #64748b;\r\n    flex: 1;\r\n    text-align: right;\r\n}\r\n\r\n/* ── Log Tab Bar ── */\r\n.toki-log-tabs {\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 4px;\r\n    margin-bottom: 8px;\r\n    flex-shrink: 0;\r\n}\r\n\r\n.toki-log-tab-btn {\r\n    background: rgba(255, 255, 255, 0.04);\r\n    border: 1px solid transparent;\r\n    padding: 4px 12px;\r\n    border-radius: 6px;\r\n    cursor: pointer;\r\n    font-size: 11px;\r\n    font-weight: 600;\r\n    color: #94a3b8;\r\n    transition: all 0.15s;\r\n    font-family: inherit;\r\n}\r\n\r\n.toki-log-tab-btn:hover {\r\n    background: rgba(255, 255, 255, 0.1);\r\n    color: #e0e0e0;\r\n}\r\n\r\n.toki-log-tab-btn.active {\r\n    background: rgba(99, 102, 241, 0.15);\r\n    border-color: rgba(99, 102, 241, 0.3);\r\n    color: #a5b4fc;\r\n}\r\n\r\n.toki-log-tabs-right {\r\n    margin-left: auto;\r\n}\r\n\r\n.toki-log-tabs-right button {\r\n    background: none;\r\n    border: none;\r\n    cursor: pointer;\r\n    font-size: 12px;\r\n    color: #e6a23c;\r\n    padding: 4px 8px;\r\n    border-radius: 4px;\r\n    font-family: inherit;\r\n    transition: color 0.15s;\r\n}\r\n\r\n.toki-log-tabs-right button:hover {\r\n    color: #f59e0b;\r\n}\r\n\r\n/* ── Log Panels ── */\r\n.toki-log-panel {\r\n    display: none !important;\r\n    flex-direction: column;\r\n    flex: 1;\r\n    overflow: hidden;\r\n}\r\n\r\n.toki-log-panel.active {\r\n    display: flex !important;\r\n}\r\n\r\n/* ── Debug Console ── */\r\n#toki-debug-console-header {\r\n    display: flex;\r\n    align-items: center;\r\n    gap: 8px;\r\n    margin-bottom: 6px;\r\n    flex-shrink: 0;\r\n}\r\n\r\n.toki-console-toggle-btn {\r\n    background: rgba(255, 255, 255, 0.06);\r\n    border: 1px solid rgba(255, 255, 255, 0.1);\r\n    padding: 3px 10px;\r\n    border-radius: 4px;\r\n    cursor: pointer;\r\n    font-size: 11px;\r\n    color: #94a3b8;\r\n    font-family: inherit;\r\n    font-weight: 600;\r\n    transition: all 0.15s;\r\n}\r\n\r\n.toki-console-toggle-btn:hover {\r\n    background: rgba(255, 255, 255, 0.12);\r\n}\r\n\r\n.toki-console-toggle-btn.on {\r\n    color: #4ade80;\r\n    border-color: rgba(74, 222, 128, 0.3);\r\n}\r\n\r\n.toki-console-status {\r\n    font-size: 10px;\r\n    color: #64748b;\r\n}\r\n\r\n#toki-debug-console-content {\r\n    flex: 1;\r\n    overflow-y: auto;\r\n    padding: 8px;\r\n    margin: 0;\r\n    list-style: none;\r\n    background: rgba(0, 0, 0, 0.2);\r\n    border-radius: 8px;\r\n    border: 1px solid rgba(255, 255, 255, 0.03);\r\n    min-height: 280px;\r\n    font-family: 'Cascadia Code', Consolas, monospace;\r\n    font-size: 11px;\r\n}\r\n\r\n#toki-debug-console-content::-webkit-scrollbar {\r\n    width: 4px;\r\n}\r\n#toki-debug-console-content::-webkit-scrollbar-track {\r\n    background: transparent;\r\n}\r\n#toki-debug-console-content::-webkit-scrollbar-thumb {\r\n    background: rgba(255, 255, 255, 0.08);\r\n    border-radius: 999px;\r\n}\r\n\r\n#toki-debug-console-content li {\r\n    margin-bottom: 2px;\r\n    padding: 2px 6px;\r\n    border-radius: 3px;\r\n    word-break: break-all;\r\n    line-height: 1.5;\r\n}\r\n\r\n#toki-debug-console-content li.log,\r\n#toki-debug-console-content li.info {\r\n    color: #e0e0e0;\r\n}\r\n\r\n#toki-debug-console-content li.warn {\r\n    color: #f9e2af;\r\n}\r\n\r\n#toki-debug-console-content li.error,\r\n#toki-debug-console-content li.critical {\r\n    color: #f38ba8;\r\n}\r\n\r\n#toki-debug-console-content li.success {\r\n    color: #a6e3a1;\r\n}\r\n";
 ;// ./src/core/ui/LogBox.js
 /**
  * LogBox Module for TokiSync
@@ -7583,20 +6959,6 @@ class LogBox {
         // 개별 활성 팝업(Worker) 진행 상황 렌더링
         if (listEl) {
             const activeWorkers = queue.filter(item => item.status === 'processing');
-            
-            // [v1.26.6] 새 워커 진행률 카드 생성 감지 진단
-            const currentIds = new Set(activeWorkers.map(w => w.id));
-            if (!this._prevProgressIds) this._prevProgressIds = new Set();
-            const newWorkerIds = activeWorkers.filter(w => !this._prevProgressIds.has(w.id));
-            for (const w of newWorkerIds) {
-                console.log(`[ProgressCard] 🆕 새 진행률 카드 생성: ${w.episodeTitle} (ID: ${w.id}, totalCards=${activeWorkers.length}, queueStatuses=[${queue.map(i=>i.id.substring(0,8)+':'+i.status).join(',')}])`);
-            }
-            const removedIds = [...this._prevProgressIds].filter(id => !currentIds.has(id));
-            for (const id of removedIds) {
-                console.log(`[ProgressCard] 🗑️ 진행률 카드 제거: ${id}`);
-            }
-            this._prevProgressIds = currentIds;
-            
             listEl.innerHTML = activeWorkers.map(item => {
                 let stageName = '다운로드 중';
                 if (item.stage === 'STAGE_INIT') stageName = '초기화';
@@ -8033,7 +7395,7 @@ function getConfig() {
         if (match) {
             gasId = match[1];
             if (typeof GM_setValue !== 'undefined') GM_setValue(CFG_ID_KEY, gasId);
-            console.log("✅ [Config] GAS URL 마이그레이션 완료");
+            console.log("✅ [Config] Auto-migrated GAS URL to ID:", gasId);
         }
     }
 
@@ -8921,7 +8283,6 @@ async function extractEpisodeData(targetDoc, parser, siteInfo, isStaticDoc = fal
 /* harmony export */   Q_: function() { return /* binding */ registerIpcListener; },
 /* harmony export */   Re: function() { return /* binding */ removeWorkerOrigin; },
 /* harmony export */   S6: function() { return /* binding */ registerWorkerOrigin; },
-/* harmony export */   Yv: function() { return /* binding */ getWorkerIdByNonce; },
 /* harmony export */   eu: function() { return /* binding */ sendToWorker; }
 /* harmony export */ });
 /* unused harmony exports validateNonce, getWorkerOrigin */
@@ -8949,6 +8310,7 @@ function generateNonce() {
     if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
         crypto.getRandomValues(bytes);
     } else {
+        // Fallback for older environments (should not happen in modern browsers)
         for (let i = 0; i < 32; i++) bytes[i] = Math.floor(Math.random() * 256);
     }
     return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
@@ -8982,6 +8344,7 @@ function removeWorkerOrigin(workerId, nonce) {
         _activeNonces.delete(nonce);
         _nonceToWorkerId.delete(nonce);
     } else {
+        // Invalidate all nonces belonging to this worker
         for (const [n, wid] of _nonceToWorkerId.entries()) {
             if (wid === workerId) {
                 _activeNonces.delete(n);
@@ -9008,19 +8371,11 @@ function getWorkerOrigin(workerId) {
 }
 
 /**
- * Look up workerId by nonce (reverse of validateNonce, for parent-side matching).
- */
-function getWorkerIdByNonce(nonce) {
-    return _nonceToWorkerId.get(nonce) || null;
-}
-
-/**
  * Send message from Parent to Worker popup
  * @param {Window} workerRef Reference to the worker popup window
  * @param {string} type Message type (without prefix, e.g. 'START_EXTRACTION')
  * @param {Object} payload Metadata and payload
- * @param {string} [nonce] Session nonce for validation (NOTE: nonce는 부모→자식 방향에서는
- *   사용되지 않음. 자식의 _activeNonces는 항상 비어있기 때문. payload 안에 sessionNonce로 전달.)
+ * @param {string} [nonce] Session nonce for validation
  */
 function sendToWorker(workerRef, type, payload = {}, nonce) {
     if (!workerRef || workerRef.closed) {
@@ -9433,10 +8788,7 @@ var network = __webpack_require__(391);
 var worker_controller = __webpack_require__(572);
 // EXTERNAL MODULE: ./src/core/queue.js
 var core_queue = __webpack_require__(302);
-// EXTERNAL MODULE: ./src/core/ipc-broker.js
-var ipc_broker = __webpack_require__(941);
 ;// ./src/core/downloader.js
-
 
 
 
@@ -9462,10 +8814,8 @@ async function shouldSkipEpisode({
     historyCheckTimeoutFlag,
     historyFolderId,
     logOnSkip = false,
-    episodeTitle = '',
-    forceOverwrite = false
+    episodeTitle = ''
 }) {
-    if (forceOverwrite) return false;
     if (isSingleVolume) return false;
     if (destination !== 'drive' && destination !== 'drive_kavita') return false;
 
@@ -9595,10 +8945,8 @@ async function processItem(item, builder, siteInfo, iframe, parser, seriesTitle 
             }
         }
     } finally {
-        // [H2] 세션 정리 — 단일/배치 무관하게 항상 실행
+        // [H2] activeWorkers 정리 — 단일/배치 무관하게 항상 실행
         core_queue/* activeWorkers */.mR.delete(id);
-        core_queue/* processingSlots */.PG.delete(id);
-        core_queue/* sessionRegistry */.a.delete(id);
         
         // 단일 합본 및 배치 모드가 아닐 때만 즉시 큐 청소 (UI 지속 노출 보장)
         if (!isSingleVolume && buildingPolicy !== 'zipOfCbzs') {
@@ -9631,7 +8979,10 @@ function parseRangeSpec(spec) {
     return nums.size > 0 ? nums : null;
 }
 
+console.log("MY DEBUG");
+
 async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = false) {
+    console.log("[DEBUG] rangeSpec =", rangeSpec);
     const config = (0,core_config/* getConfig */.zj)();
     let isAsyncDelegate = false;
     
@@ -9763,7 +9114,17 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
         const rangeSet = parseRangeSpec(rangeSpec);
         const mappedList = list.map(li => {
             const item = parser.parseListItem(li.element || li);
-            return { li, num: parseInt(item.num) || 0 }; // 숫자가 아니면 0으로 처리하여 상단 배치
+
+            console.log("[DEBUG]", {
+                title: item.title,
+                num: item.num,
+                src: item.src  
+            });
+
+            return {
+                li,
+                num: parseInt(item.num) || 0
+            };
         });
 
         if (rangeSet) {
@@ -9914,13 +9275,11 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                         method: "POST", url: config.gasUrl,
                         data: JSON.stringify({ type: "get_library", folderId: config.folderId, apiKey: config.apiKey, protocolVersion: 3 }),
                         headers: { "Content-Type": "text/plain" },
-                        timeout: 30000, // [v1.27.3] 30초 타임아웃 추가 (무한 대기 방지)
                         onload: (r) => {
                             try { resolve(JSON.parse(r.responseText)); } 
                             catch(e) { reject(e); }
                         },
-                        onerror: reject,
-                        ontimeout: () => reject(new Error('get_library request timed out (30s)'))
+                        onerror: reject
                     });
                 });
 
@@ -9989,8 +9348,7 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                 isSingleVolume: currentIsSingleVolume,
                 uploadedHistorySet,
                 historyCheckTimeoutFlag,
-                historyFolderId,
-                forceOverwrite
+                historyFolderId
             });
             if (isSkip) continue;
             
@@ -10005,8 +9363,7 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                 novelFormat: configNovelFormat,
                 matchedRule: parser.rule,
                 protocolDomain: parser.protocolDomain || window.location.origin,
-                seriesMetadata: seriesMetadata,
-                forceOverwrite: forceOverwrite || false
+                seriesMetadata: seriesMetadata
             });
         }
 
@@ -10077,20 +9434,9 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                 );
 
                 if (popupRef) {
-                    // [v1.27.0] 세션 토큰 사전 발급 → URL fallback 매칭 보장
-                    const sessionToken = (0,ipc_broker/* registerWorkerOrigin */.S6)(id, 'null');
-                    core_queue/* processingSlots */.PG.add(id);
-                    const qItem = (0,core_queue/* getQueue */.IS)().find(i => i.id === id);
-                    core_queue/* sessionRegistry */.a.set(id, {
-                        sessionToken,
-                        popupRef,
-                        createdAt: Date.now(),
-                        lastActivity: Date.now(),
-                        queueItemRef: qItem || null
-                    });
                     core_queue/* activeWorkers */.mR.set(id, popupRef);
+                    (0,core_queue/* updateQueueItem */.Gg)(id, { status: 'processing', stage: core_queue/* WORKER_STAGE */.WB.INIT });
                     freshlyOpened.push(id);
-                    console.log(`[Pre-open] 🔐 세션 등록: ${id} → token=${sessionToken.substring(0, 8)}...`);
                 } else {
                     logger.logger.error(`❌ [Pre-open #${i + 1}] 브라우저 차단으로 자식 창 확보에 실패하였습니다.`, 'Queue');
                 }
@@ -10144,8 +9490,7 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                 historyCheckTimeoutFlag,
                 historyFolderId,
                 logOnSkip: true,
-                episodeTitle: item.title,
-                forceOverwrite
+                episodeTitle: item.title
             });
             if (isSkip) continue;
 
@@ -10362,8 +9707,7 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                         logger.logger.log(`[Upload] 일반 업로드(Create/POST) 진행...`);
                         await (0,utils/* saveFile */.OJ)(blob, fullFilename, destination, extension, {
                             folderName: rootFolder,
-                            category: category,
-                            forceOverwrite: forceOverwrite || false
+                            category: category
                         });
                     }
                 }
@@ -10431,8 +9775,7 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
                     
                     await (0,utils/* saveFile */.OJ)(finalBlob, finalFilename, destination, extension, {
                         folderName: rootFolder,
-                        category: category,
-                        forceOverwrite: forceOverwrite || false
+                        category: category
                     });
                     
                     logger.logger.success(`✅ 단행본 합본 저장 완료: ${finalFilename}`);
@@ -10544,18 +9887,6 @@ async function generateDownloadReport(seriesTitle, seriesId, listCount, failedEp
 
 // EXTERNAL MODULE: ./src/core/parsers/SubscriptionManager.js
 var SubscriptionManager = __webpack_require__(330);
-;// ./src/core/version.js
-/**
- * Centralized version module
- * All version strings are injected at build time by Webpack/Vite DefinePlugin.
- * Fallback values (0.0.0) are never used in production builds.
- */
-const SCRIPT_VERSION =  true
-  ? "1.27.4" : 0;
-
-const VIEWER_VERSION = (/* unused pure expression or super */ null && ( true
-  ? "1.27.4" : 0));
-
 ;// ./src/core/main.js
 
  
@@ -10574,9 +9905,8 @@ const VIEWER_VERSION = (/* unused pure expression or super */ null && ( true
 
 
 
-
 async function main() {
-    console.log(`🚀 TokiDownloader Loaded (New Core v${SCRIPT_VERSION})`);
+    console.log("🚀 TokiDownloader Loaded (New Core v1.26.4)");
 
     // -- 0. Bootstrap UI Instances --
     const _logbox = ui/* LogBox */.ej.getInstance();
@@ -11056,6 +10386,8 @@ async function main() {
     });
 }
 
+// EXTERNAL MODULE: ./src/core/ipc-broker.js
+var ipc_broker = __webpack_require__(941);
 // EXTERNAL MODULE: ./src/core/novel-decryptor.js
 var novel_decryptor = __webpack_require__(602);
 ;// ./src/core/worker-extractor.js
@@ -11077,6 +10409,7 @@ let workerIpcCleanup = null;
 
 // Define localized stage reporting helper
 function reportProgress(queueId, percent, stage) {
+    // Send lightweight progress update to parent UI
     (0,ipc_broker/* sendToParent */.Ac)('WORKER_PROGRESS', {
         queueId,
         percent: Math.min(100, Math.max(0, Math.round(percent))),
@@ -11568,6 +10901,7 @@ function initWorkerExtractor() {
 
                 } catch (err) {
                     console.error(`[TokiSync:Worker] ❌ 에피소드 수집 중 치명적 오류 발생:`, err);
+                    // Notify parent that task failed
                     (0,ipc_broker/* sendToParent */.Ac)('TASK_FAILED', { queueId, errorMsg: err.message });
                     closeSelf();
                 }

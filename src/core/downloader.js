@@ -188,6 +188,8 @@ export function parseRangeSpec(spec) {
     return nums.size > 0 ? nums : null;
 }
 
+console.log("MY DEBUG");
+
 export async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = false) {
     console.log("[DEBUG] rangeSpec =", rangeSpec);
     const config = getConfig();
