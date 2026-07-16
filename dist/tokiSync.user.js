@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.27.4
 // @description  Toki series sites -> Google Drive syncing tool (Bundled)
-// @author       pray4skylark
+// @author       hk-hash-d
 // @updateURL    https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
 // @downloadURL  https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
 // @match        *://*/*webtoon/*
