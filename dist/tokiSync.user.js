@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TokiSync (Link to Drive)
 // @namespace    http://tampermonkey.net/
-// @version      1.26.4
+// @version      1.27.4
 // @description  Toki series sites -> Google Drive syncing tool (Bundled)
 // @author       hk-hash-d
 // @updateURL    https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
@@ -15,7 +15,7 @@
 // @include      *://*toki*/*
 // @include      *://*toon*/*
 // @match        https://script.google.com/*
-// @match        https://hk-hash-d.github.io/Hash_TS_Custom/*
+// @match        https://*.github.io/Hash_TS_Custom/*
 // @match        https://hk-hash-d.github.io/Hash_TS_Custom/*
 // @include      http://localhost:*/*
 // @include      http://127.0.0.1:*/*
@@ -8805,6 +8805,8 @@ var core_queue = __webpack_require__(302);
 
 
 
+
+console.log("★★★★ MY DOWNLOADER LOADED ★★★★");
 
 async function shouldSkipEpisode({
     numStr,

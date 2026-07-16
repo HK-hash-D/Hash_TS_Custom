@@ -15,6 +15,8 @@ import { fetchHistoryDirect, checkSingleHistoryDirect, getOAuthToken, getOrCreat
 import { fetchNovelText, fetchComicImages, closeActiveWorker, initBatchWorkerController } from './worker-controller.js';
 import { addEpisodesToQueue, initQueueScheduler, activeWorkers, WORKER_STAGE, updateQueueItem, getQueue, removeQueueItem, getQueueItemId, clearQueue, stopAllWorkers } from './queue.js';
 
+console.log("★★★★ MY DOWNLOADER LOADED ★★★★");
+
 async function shouldSkipEpisode({
     numStr,
     destination,
