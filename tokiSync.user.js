@@ -2011,6 +2011,12 @@ class GenericParser extends BaseParser {
 
     parseListItem(el) {
         const listCfg = this.rule.list || {};
+
+    console.log("[LIST CFG]", listCfg);
+    console.log("[NUM CFG]", listCfg.num);
+    console.log("[EL HTML]", el.outerHTML.substring(0, 500));
+
+
         let numRaw = "0";
         const numCfg = listCfg.num;
         if (Array.isArray(numCfg)) {
