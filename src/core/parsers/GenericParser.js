@@ -163,6 +163,14 @@ export class GenericParser extends BaseParser {
         // Reverse if it's a typical episode list where latest is on top but we need chronological for some logic?
         // Actually, TokiParser reverses. Let's check if we should always reverse.
         // For now, return as is.
+        
+        console.log("===== GenericParser =====");
+        console.log("container :", listCfg.container);
+        console.log("item :", listCfg.item);
+        console.log("count :", items.length);
+        console.log(items);
+
+
         return items;
     }
 
