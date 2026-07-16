@@ -321,6 +321,169 @@ export async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwri
         // Get List
         let list = await parser.getListItems();
 
+
+// 페이지 추가 탐색 함수
+async function loadMorePagesUntilFound() {
+
+    if (!rangeSet) return;
+
+    const getMatchedCount = () => {
+        return list.filter(li => {
+            const item = parser.parseListItem(li.element || li);
+            return rangeSet.has(parseInt(item.num));
+        }).length;
+    };
+
+
+    // 이미 현재 페이지에 있으면 종료
+    if (getMatchedCount() >= rangeSet.size) {
+        return;
+    }
+
+
+    const currentUrl = new URL(location.href);
+    const currentPage =
+        parseInt(currentUrl.searchParams.get("epage") || "1");
+
+
+    // 최대 50페이지까지만 탐색
+    for (let offset = 1; offset <= 50; offset++) {
+
+        const nextPage = currentPage + offset;
+
+        // 캡차 방지용 랜덤 대기
+        await new Promise(resolve =>
+            setTimeout(
+                resolve,
+                1500 + Math.random() * 2000
+            )
+        );
+
+
+        const url = new URL(location.href);
+        url.searchParams.set("epage", nextPage);
+
+
+        console.log(
+            `[페이지 탐색] epage=${nextPage}`
+        );
+
+
+        try {
+
+            const response = await fetch(url.href);
+
+            if (!response.ok) {
+                continue;
+            }
+
+
+            const html = await response.text();
+
+            const doc =
+                new DOMParser()
+                .parseFromString(
+                    html,
+                    "text/html"
+                );
+
+
+            const listSelector =
+                parser.rule?.list?.item;
+
+
+            if (!listSelector) {
+                console.warn(
+                    "list selector 없음"
+                );
+                break;
+            }
+
+
+            const newItems =
+                Array.from(
+                    doc.querySelectorAll(listSelector)
+                );
+
+
+            if (!newItems.length) {
+                console.log(
+                    "더 이상 페이지 없음"
+                );
+                break;
+            }
+
+
+            list.push(...newItems);
+
+
+            console.log(
+                `epage=${nextPage} ${newItems.length}개 추가`
+            );
+
+
+            if (getMatchedCount() >= rangeSet.size) {
+                console.log(
+                    "필요 회차 모두 발견"
+                );
+                break;
+            }
+
+
+        } catch(e) {
+
+            console.warn(
+                `epage=${nextPage} 실패`,
+                e
+            );
+
+        }
+    }
+}
+
+
+// 필요한 회차 찾기
+await loadMorePagesUntilFound();
+
+
+
+if (rangeSet) {
+
+    list =
+        mappedList
+            .filter(item =>
+                rangeSet.has(item.num)
+            )
+            .sort((a,b)=>
+                a.num-b.num
+            )
+            .map(item =>
+                item.li
+            );
+
+
+    logger.log(
+        `범위 필터 적용 및 오름차순 정렬 완료: ${rangeSpec} → ${list.length}개 항목`
+    );
+
+
+} else {
+
+    list =
+        mappedList
+            .sort((a,b)=>
+                a.num-b.num
+            )
+            .map(item =>
+                item.li
+            );
+
+
+    logger.log(
+        `전체 항목 오름차순 정렬 완료: ${list.length}개 항목`
+    );
+}
+
         // [v1.9.1] 정렬 로직 통합: 범위 필터 여부와 상관없이 항상 오름차순(1화~N화)으로 정렬
         const rangeSet = parseRangeSpec(rangeSpec);
         const mappedList = list.map(li => {
