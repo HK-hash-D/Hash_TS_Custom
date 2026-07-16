@@ -189,6 +189,7 @@ export function parseRangeSpec(spec) {
 }
 
 export async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = false) {
+    console.log("[DEBUG] rangeSpec =", rangeSpec);
     const config = getConfig();
     let isAsyncDelegate = false;
     
@@ -320,7 +321,17 @@ export async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwri
         const rangeSet = parseRangeSpec(rangeSpec);
         const mappedList = list.map(li => {
             const item = parser.parseListItem(li.element || li);
-            return { li, num: parseInt(item.num) || 0 }; // 숫자가 아니면 0으로 처리하여 상단 배치
+
+            console.log("[DEBUG]", {
+                title: item.title,
+                num: item.num,
+                src: item.src  
+            });
+
+            return {
+                li,
+                num: parseInt(item.num) || 0
+            };
         });
 
         if (rangeSet) {
