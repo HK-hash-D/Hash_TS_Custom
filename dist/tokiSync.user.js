@@ -4762,7 +4762,7 @@ class FormRuleEditor {
             list: {
                 container: 'ul.list',
                 item: 'li.item',
-                num: 'span.no',
+                num: 'span.ne-num',
                 title: 'a.link',
                 link: { selector: 'a.link', attr: 'href' }
             },
@@ -4942,7 +4942,7 @@ class FormRuleEditor {
                                         </div>
                                     </div>
                                     <div class="toki-flex-row-8">
-                                        <input type="text" id="rule-list-num" class="toki-input-compact toki-flex-1" placeholder='예: span.no 또는 [{"attr":"data-num"}, "span.ne-num"]'>
+                                        <input type="text" id="rule-list-num" class="toki-input-compact toki-flex-1" placeholder='예: span.ne-num 또는 [{"attr":"data-num"}, "span.ne-num"]'>
                                         <span class="toki-badge-match zero" id="match-rule-list-num">0</span>
                                     </div>
                                     <div class="toki-form-verify-result" id="verify-rule-list-num" style="display: none;"></div>
@@ -5174,7 +5174,7 @@ class FormRuleEditor {
         rule.list = {
             container: this.getValue('rule-list-container'),
             item: this.getValue('rule-list-item'),
-            num: numParsed || 'span.no',
+            num: numParsed || 'span.ne-num',
             title: this.getValue('rule-list-title'),
             link: {
                 selector: this.getValue('rule-list-link-selector'),
