@@ -3,9 +3,9 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.26.4
 // @description  Toki series sites -> Google Drive syncing tool (Bundled)
-// @author       pray4skylark
-// @updateURL    https://pray4skylark.github.io/tokiSync/tokiSync.user.js
-// @downloadURL  https://pray4skylark.github.io/tokiSync/tokiSync.user.js
+// @author       hk-hash-d
+// @updateURL    https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
+// @downloadURL  https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
 // @match        *://*/*webtoon/*
 // @match        *://*/*novel/*
 // @match        *://*/*manhwa/*
@@ -15,8 +15,8 @@
 // @include      *://*toki*/*
 // @include      *://*toon*/*
 // @match        https://script.google.com/*
-// @match        https://*.github.io/tokiSync/*
-// @match        https://pray4skylark.github.io/tokiSync/*
+// @match        https://hk-hash-d.github.io/Hash_TS_Custom/*
+// @match        https://hk-hash-d.github.io/Hash_TS_Custom/*
 // @include      http://localhost:*/*
 // @include      http://127.0.0.1:*/*
 // @icon         https://github.com/user-attachments/assets/99f5bb36-4ef8-40cc-8ae5-e3bf1c7952ad
@@ -31,7 +31,7 @@
 // @connect      raw.githubusercontent.com
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
-// @connect      pray4skylark.github.io
+// @connect      hk-hash-d.github.io
 // @connect      127.0.0.1
 // @connect      localhost
 // @connect      *
@@ -9957,7 +9957,7 @@ async function main() {
 
     const openViewer = () => {
          const config = (0,core_config/* getConfig */.zj)();
-         const viewerUrl = "https://pray4skylark.github.io/tokiSync/";
+         const viewerUrl = "https://hk-hash-d.github.io/Hash_TS_Custom/";
          const win = window.open(viewerUrl, "_blank");
          
          if(win) {
