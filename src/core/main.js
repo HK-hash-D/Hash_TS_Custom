@@ -80,7 +80,7 @@ export async function main() {
 
     const openViewer = () => {
          const config = getConfig();
-         const viewerUrl = "https://pray4skylark.github.io/tokiSync/";
+         const viewerUrl = "https://hk-hash-d.github.io/Hash_TS_Custom/";
          const win = window.open(viewerUrl, "_blank");
          
          if(win) {
