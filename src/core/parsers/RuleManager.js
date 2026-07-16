@@ -28,7 +28,7 @@ export class RuleManager {
             list: {
                 container: ".list-body",
                 item: "li",
-                num: "span.no",
+                num: "span.ne-num",
                 title: "a",
                 link: {
                     selector: "a",
