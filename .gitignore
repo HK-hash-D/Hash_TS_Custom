@@ -18,7 +18,7 @@ gas_v3_refactoring_analysis.md
 walkthrough.md
 
 # Temporary build artifacts
-dist/
+#dist/
 
 # Consolidated Handover File
 PROJECT_HANDOVER_MASTER.md
