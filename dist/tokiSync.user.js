@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TokiSync (Link to Drive)
 // @namespace    http://tampermonkey.net/
-// @version      1.27.4
+// @version      1.26.4
 // @description  Toki series sites -> Google Drive syncing tool (Bundled)
 // @author       hk-hash-d
 // @updateURL    https://hk-hash-d.github.io/Hash_TS_Custom/dist/tokiSync.user.js
