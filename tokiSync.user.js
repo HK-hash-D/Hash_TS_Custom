@@ -15,7 +15,7 @@
 // @include      *://*toki*/*
 // @include      *://*toon*/*
 // @match        https://script.google.com/*
-// @match        https://hk-hash-d.github.io/Hash_TS_Custom/*
+// @match        https://*.github.io/Hash_TS_Custom/*
 // @match        https://hk-hash-d.github.io/Hash_TS_Custom/*
 // @include      http://localhost:*/*
 // @include      http://127.0.0.1:*/*
@@ -8805,6 +8805,8 @@ var core_queue = __webpack_require__(302);
 
 
 
+
+console.log("★★★★ MY DOWNLOADER LOADED ★★★★");
 
 async function shouldSkipEpisode({
     numStr,
