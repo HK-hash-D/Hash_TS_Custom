@@ -9118,6 +9118,23 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
         // Get List
         let list = await parser.getListItems();
 
+ // [v1.9.1] 정렬 로직 통합: 범위 필터 여부와 상관없이 항상 오름차순(1화~N화)으로 정렬
+        const rangeSet = parseRangeSpec(rangeSpec);
+        const mappedList = list.map(li => {
+            const item = parser.parseListItem(li.element || li);
+
+            console.log("[DEBUG]", {
+                title: item.title,
+                num: item.num,
+                src: item.src  
+            });
+
+            return {
+                li,
+                num: parseInt(item.num) || 0
+            };
+        });
+
 
 // 페이지 추가 탐색 함수
 async function loadMorePagesUntilFound() {
@@ -9281,22 +9298,7 @@ if (rangeSet) {
     );
 }
 
-        // [v1.9.1] 정렬 로직 통합: 범위 필터 여부와 상관없이 항상 오름차순(1화~N화)으로 정렬
-        const rangeSet = parseRangeSpec(rangeSpec);
-        const mappedList = list.map(li => {
-            const item = parser.parseListItem(li.element || li);
-
-            console.log("[DEBUG]", {
-                title: item.title,
-                num: item.num,
-                src: item.src  
-            });
-
-            return {
-                li,
-                num: parseInt(item.num) || 0
-            };
-        });
+       
 
         if (rangeSet) {
             list = mappedList.filter(item => rangeSet.has(item.num))
