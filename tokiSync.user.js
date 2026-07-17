@@ -176,7 +176,7 @@ const WORKER_STAGE = {
 };
 
 const STORAGE_KEY = 'TOKI_DOWNLOAD_QUEUE';
-const MAX_CONCURRENCY = 2; // 최대 동시 다운로드 수
+const MAX_CONCURRENCY = 1; // 최대 동시 다운로드 수
 
 // 임시 팝업 창 참조 보관용 맵 (Liveness check 및 재활용 루프 대비)
 const activeWorkers = new Map();
@@ -593,7 +593,7 @@ const runSchedulerOnce = async () => {
       startSilentAudio();
     } catch (e) {}
 
-    await sleepJitter(2000, 4000);
+    await sleepJitter(7000, 12000);
 
     // [v1.21.8] 대기 지터 완료 후 사용자의 정지/일시정지 클릭 및 상태 정합성 재검증
     const freshQueue = getRawQueue();
@@ -9248,7 +9248,7 @@ async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwrite = fa
         await new Promise(resolve =>
             setTimeout(
                 resolve,
-                1500 + Math.random() * 2500
+                4000 + Math.random() * 6000
             )
         );
 
