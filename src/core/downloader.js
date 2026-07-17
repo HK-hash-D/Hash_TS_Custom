@@ -318,199 +318,320 @@ export async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwri
             extension = EXTENSION_MAP[category] ?? 'cbz';
         }
 
+        // 범위 정보
+        const rangeSet = parseRangeSpec(rangeSpec);
+
         // Get List
         let list = await parser.getListItems();
 
-
-        // 범위 정보
-        const rangeSet = parseRangeSpec(rangeSpec);
 
 
         // 페이지 추가 탐색
         async function loadMorePagesUntilFound() {
 
-            if (!rangeSet) return;
+    if (!rangeSet || rangeSet.size === 0) {
+        return;
+    }
 
 
-            const getMatchedCount = () => {
+    const getMatchedCount = () => {
 
-                return list.filter(li => {
+        const found = new Set();
 
-                    const item =
-                        parser.parseListItem(
-                            li.element || li
-                        );
+        for (const li of list) {
 
-                    return rangeSet.has(
-                        parseInt(item.num)
-                    );
+            try {
 
-                }).length;
+                const item = parser.parseListItem(li.element || li);
 
-            };
+                const num = parseInt(item.num);
+
+                if (!isNaN(num) && rangeSet.has(num)) {
+                    found.add(num);
+                }
+
+            } catch(e) {
+
+            }
+        }
+
+        return found.size;
+    };
 
 
-            // 현재 페이지에 모두 있으면 종료
-            if (getMatchedCount() >= rangeSet.size) {
-                return;
+    // 현재 페이지에서 이미 필요한 회차가 모두 있으면 종료
+    if (getMatchedCount() >= rangeSet.size) {
+
+        console.log(
+            `[페이지 탐색] 현재 페이지에서 필요한 회차 모두 발견 (${getMatchedCount()}/${rangeSet.size})`
+        );
+
+        return;
+    }
+
+
+
+    const currentUrl = new URL(location.href);
+
+    const currentPage =
+        parseInt(
+            currentUrl.searchParams.get("epage") || "1"
+        );
+
+
+
+    /*
+        현재 페이지 기준 좌우 탐색
+
+        예:
+        epage=8
+
+        7
+        9
+        6
+        10
+        5
+        11
+        ...
+    */
+
+    const pagesToCheck = [];
+
+    for (let i = 1; i <= 50; i++) {
+
+        if (currentPage - i >= 1) {
+            pagesToCheck.push(currentPage - i);
+        }
+
+        pagesToCheck.push(currentPage + i);
+
+    }
+
+
+
+    const existingNums = new Set();
+
+
+    // 기존 목록 번호 저장
+    for (const li of list) {
+
+        try {
+
+            const item =
+                parser.parseListItem(li.element || li);
+
+            const num =
+                parseInt(item.num);
+
+            if (!isNaN(num)) {
+                existingNums.add(num);
+            }
+
+        } catch(e) {}
+
+    }
+
+
+
+    for (const nextPage of pagesToCheck) {
+
+
+        if (getMatchedCount() >= rangeSet.size) {
+
+            console.log(
+                `[페이지 탐색 완료] ${getMatchedCount()}/${rangeSet.size}`
+            );
+
+            break;
+        }
+
+
+
+        // 캡차 방지 딜레이
+        await new Promise(resolve =>
+            setTimeout(
+                resolve,
+                1500 + Math.random() * 2500
+            )
+        );
+
+
+
+        const url = new URL(location.href);
+
+        url.searchParams.set(
+            "epage",
+            nextPage
+        );
+
+
+
+        console.log(
+            `[페이지 탐색] epage=${nextPage}`
+        );
+
+
+
+        try {
+
+
+            const response =
+                await fetch(
+                    url.href,
+                    {
+                        credentials: "include"
+                    }
+                );
+
+
+            if (!response.ok) {
+
+                console.warn(
+                    `epage=${nextPage} 응답 실패`
+                );
+
+                continue;
             }
 
 
-            const currentUrl =
-                new URL(location.href);
+
+            const html =
+                await response.text();
 
 
-            const currentPage =
-                parseInt(
-                    currentUrl.searchParams.get("epage") || "1"
+
+            const doc =
+                new DOMParser()
+                    .parseFromString(
+                        html,
+                        "text/html"
+                    );
+
+
+
+            const itemSelector =
+                parser.rule?.list?.item;
+
+
+
+            if (!itemSelector) {
+
+                console.warn(
+                    "list item selector 없음"
                 );
 
-
-            // 최대 50페이지 탐색
-            for (
-                let offset = 1;
-                offset <= 50;
-                offset++
-            ) {
-
-
-                const nextPage =
-                    currentPage + offset;
+                break;
+            }
 
 
 
-                // 캡차 방지
-                await sleep(
-                    2000 +
-                    Math.random() * 2000
-                );
-
-
-
-                const url =
-                    new URL(location.href);
-
-
-                url.searchParams.set(
-                    "epage",
-                    nextPage
+            const newItems =
+                Array.from(
+                    doc.querySelectorAll(itemSelector)
                 );
 
 
 
-                logger.log(
-                    `[페이지 탐색] epage=${nextPage}`
+            if (!newItems.length) {
+
+                console.log(
+                    `epage=${nextPage} 항목 없음`
                 );
 
+                continue;
+            }
+
+
+
+            let added = 0;
+
+
+
+            for (const item of newItems) {
 
 
                 try {
 
-
-                    const response =
-                        await fetch(
-                            url.href
-                        );
+                    const parsed =
+                        parser.parseListItem(item);
 
 
-
-                    if (!response.ok) {
-                        continue;
-                    }
-
-
-
-                    const html =
-                        await response.text();
-
-
-
-                    const doc =
-                        new DOMParser()
-                        .parseFromString(
-                            html,
-                            "text/html"
-                        );
-
-
-
-                    const selector =
-                        parser.rule?.list?.item;
-
-
-
-                    if (!selector) {
-
-                        logger.warn(
-                            "페이지 탐색 실패: list selector 없음"
-                        );
-
-                        break;
-                    }
-
-
-
-                    const newItems =
-                        Array.from(
-                            doc.querySelectorAll(
-                                selector
-                            )
-                        );
-
-
-
-                    if (!newItems.length) {
-
-                        logger.log(
-                            "더 이상 페이지 없음"
-                        );
-
-                        break;
-                    }
-
-
-
-                    list.push(
-                        ...newItems
-                    );
-
-
-
-                    logger.log(
-                        `epage=${nextPage} ${newItems.length}개 추가`
-                    );
+                    const num =
+                        parseInt(parsed.num);
 
 
 
                     if (
-                        getMatchedCount()
-                        >=
-                        rangeSet.size
+                        !isNaN(num)
+                        &&
+                        !existingNums.has(num)
                     ) {
 
-                        logger.log(
-                            "필요 회차 모두 발견"
-                        );
+                        list.push(item);
 
-                        break;
+                        existingNums.add(num);
+
+                        added++;
 
                     }
 
 
-
                 } catch(e) {
-
-
-                    logger.warn(
-                        `epage=${nextPage} 실패 : ${e.message}`
-                    );
-
 
                 }
 
             }
 
+
+
+            console.log(
+                `epage=${nextPage} ${added}개 추가`
+            );
+
+
+
+            console.log(
+                `현재 확보 회차 ${getMatchedCount()}/${rangeSet.size}`
+            );
+
+
+
+            if (
+                getMatchedCount()
+                >=
+                rangeSet.size
+            ) {
+
+                console.log(
+                    "필요 회차 모두 발견"
+                );
+
+                break;
+
+            }
+
+
+
+        } catch(e) {
+
+
+            console.warn(
+                `epage=${nextPage} 실패`,
+                e
+            );
+
+
         }
+
+    }
+
+
+
+    console.log(
+        `[페이지 탐색 종료] 최종 ${getMatchedCount()}/${rangeSet.size}`
+    );
+
+}
 
 
 
