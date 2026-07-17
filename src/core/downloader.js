@@ -451,7 +451,7 @@ export async function tokiDownload(rangeSpec, policy = 'zipOfCbzs', forceOverwri
         await new Promise(resolve =>
             setTimeout(
                 resolve,
-                1500 + Math.random() * 2500
+                4000 + Math.random() * 6000
             )
         );
 
